@@ -16,7 +16,7 @@ from typing import Any, List, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
 from PIL import Image as PILImage
-from PIL import ImageColor, ImageDraw
+from PIL import ImageChops, ImageColor, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
 
 mcp = FastMCP("pixelart_mcp")
@@ -261,6 +261,14 @@ class ExportGifInput(BaseModel):
     )
     out_path: str = Field(..., description="Destination path ending in .gif")
     duration_ms: int = Field(default=100, ge=20, le=5000, description="Time per frame in milliseconds")
+    durations_ms: Optional[List[int]] = Field(
+        default=None,
+        description="Per-frame durations in ms, one per entry in frame_paths; overrides duration_ms",
+    )
+    ping_pong: bool = Field(
+        default=False,
+        description="Play frames forward then backward (1,2,3,2 loop) — good for idle/bounce cycles",
+    )
     scale: int = Field(default=1, ge=1, le=MAX_SCALE, description="Nearest-neighbor upscale factor")
 
 
@@ -731,21 +739,35 @@ async def pixel_export_png(params: ExportPngInput) -> str:
 async def pixel_export_gif(params: ExportGifInput) -> str:
     """Combine same-size canvas PNGs into a looping animated GIF.
 
-    Frames play in the order given at duration_ms per frame. Transparency is
-    preserved as GIF binary transparency (alpha <= 128 becomes transparent).
-    Source canvases are untouched. Returns JSON {"exported", "frames",
-    "duration_ms", "scale", "width", "height"}. On failure returns "Error: ...".
+    Frames play in the order given at duration_ms per frame (or per-frame
+    durations_ms). ping_pong=true plays forward then backward for seamless
+    bounce/idle loops. Transparency is preserved as GIF binary transparency
+    (alpha <= 128 becomes transparent). Source canvases are untouched.
+    Returns JSON {"exported", "frames", "frames_played", "scale", "width",
+    "height"}. On failure returns "Error: ...".
     """
     try:
         out = _resolve(params.out_path, suffix=".gif", must_exist=False)
+        if params.durations_ms is not None:
+            if len(params.durations_ms) != len(params.frame_paths):
+                return (
+                    f"Error: durations_ms has {len(params.durations_ms)} entries but there are "
+                    f"{len(params.frame_paths)} frames; provide exactly one duration per frame."
+                )
+            if any(d < 20 or d > 5000 for d in params.durations_ms):
+                return "Error: each entry in durations_ms must be between 20 and 5000 milliseconds."
         frames = [_upscaled(f, params.scale) for f in _load_frames(params.frame_paths)]
-        gif_frames = [_to_gif_frame(f) for f in frames]
+        order = list(range(len(frames)))
+        if params.ping_pong and len(frames) > 2:
+            order += list(range(len(frames) - 2, 0, -1))
+        per_frame = params.durations_ms or [params.duration_ms] * len(frames)
+        gif_frames = [_to_gif_frame(frames[i]) for i in order]
         out.parent.mkdir(parents=True, exist_ok=True)
         gif_frames[0].save(
             out,
             save_all=True,
             append_images=gif_frames[1:],
-            duration=params.duration_ms,
+            duration=[per_frame[i] for i in order],
             loop=0,
             disposal=2,
             transparency=255,
@@ -753,7 +775,7 @@ async def pixel_export_gif(params: ExportGifInput) -> str:
         return json.dumps({
             "exported": str(out),
             "frames": len(frames),
-            "duration_ms": params.duration_ms,
+            "frames_played": len(order),
             "scale": params.scale,
             "width": frames[0].width,
             "height": frames[0].height,
@@ -801,6 +823,617 @@ async def pixel_export_spritesheet(params: ExportSpritesheetInput) -> str:
             "frame_height": fh,
             "width": sheet.width,
             "height": sheet.height,
+        }, indent=2)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for animation and sprite tools
+# ---------------------------------------------------------------------------
+
+def _shift_l(mask: PILImage.Image, dx: int, dy: int) -> PILImage.Image:
+    """Shift an L-mode mask without wrapping (edges clip to black)."""
+    out = PILImage.new("L", mask.size, 0)
+    out.paste(mask, (dx, dy))
+    return out
+
+
+def _dilate(mask: PILImage.Image, corners: bool) -> PILImage.Image:
+    shifts = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    if corners:
+        shifts += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+    out = mask.copy()
+    for dx, dy in shifts:
+        out = ImageChops.lighter(out, _shift_l(mask, dx, dy))
+    return out
+
+
+def _ghost(img: PILImage.Image, factor: float, tint: Optional[tuple[int, int, int, int]]) -> PILImage.Image:
+    faded = img.getchannel("A").point(lambda a: int(a * factor))
+    if tint is not None:
+        out = PILImage.new("RGBA", img.size, (tint[0], tint[1], tint[2], 255))
+    else:
+        out = img.copy()
+    out.putalpha(faded)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Input models for animation and sprite tools
+# ---------------------------------------------------------------------------
+
+class DuplicateCanvasInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Source canvas path ending in .png")
+    dest_path: str = Field(..., description="Destination path ending in .png")
+    overwrite: bool = Field(default=False, description="Replace the destination if it already exists")
+
+
+class PasteMode(str, Enum):
+    REPLACE = "replace"
+    OVER = "over"
+
+
+class CopyRegionInput(CanvasOp):
+    x: int = Field(..., ge=0, description="Source region left edge X")
+    y: int = Field(..., ge=0, description="Source region top edge Y")
+    width: int = Field(..., ge=1, description="Region width in pixels")
+    height: int = Field(..., ge=1, description="Region height in pixels")
+    dest_path: Optional[str] = Field(
+        default=None, description="Destination canvas; omit to copy within the source canvas"
+    )
+    dest_x: int = Field(..., description="Destination X for the region's top-left (may be negative; clips)")
+    dest_y: int = Field(..., description="Destination Y for the region's top-left (may be negative; clips)")
+    mode: PasteMode = Field(
+        default=PasteMode.OVER,
+        description="'over' composites respecting transparency; 'replace' overwrites the rect including alpha",
+    )
+
+
+class ShiftCanvasInput(CanvasOp):
+    dx: int = Field(..., ge=-MAX_DIM, le=MAX_DIM, description="Horizontal shift in pixels (positive = right)")
+    dy: int = Field(..., ge=-MAX_DIM, le=MAX_DIM, description="Vertical shift in pixels (positive = down)")
+    wrap: bool = Field(default=False, description="Wrap pixels around edges instead of shifting them off-canvas")
+
+
+class Anchor(str, Enum):
+    TOP_LEFT = "top_left"
+    TOP = "top"
+    TOP_RIGHT = "top_right"
+    LEFT = "left"
+    CENTER = "center"
+    RIGHT = "right"
+    BOTTOM_LEFT = "bottom_left"
+    BOTTOM = "bottom"
+    BOTTOM_RIGHT = "bottom_right"
+
+
+_ANCHOR_FRACTIONS = {
+    Anchor.TOP_LEFT: (0.0, 0.0), Anchor.TOP: (0.5, 0.0), Anchor.TOP_RIGHT: (1.0, 0.0),
+    Anchor.LEFT: (0.0, 0.5), Anchor.CENTER: (0.5, 0.5), Anchor.RIGHT: (1.0, 0.5),
+    Anchor.BOTTOM_LEFT: (0.0, 1.0), Anchor.BOTTOM: (0.5, 1.0), Anchor.BOTTOM_RIGHT: (1.0, 1.0),
+}
+
+
+class ResizeCanvasInput(CanvasOp):
+    width: int = Field(..., ge=1, le=MAX_DIM, description=f"New canvas width (1-{MAX_DIM})")
+    height: int = Field(..., ge=1, le=MAX_DIM, description=f"New canvas height (1-{MAX_DIM})")
+    anchor: Anchor = Field(
+        default=Anchor.CENTER,
+        description="Where the existing art sits in the new bounds (e.g. 'bottom' keeps feet planted)",
+    )
+
+
+class ScaleCanvasInput(CanvasOp):
+    width: int = Field(..., ge=1, le=MAX_DIM, description=f"New width (1-{MAX_DIM})")
+    height: int = Field(..., ge=1, le=MAX_DIM, description=f"New height (1-{MAX_DIM})")
+
+
+class ApplyPaletteInput(CanvasOp):
+    palette: List[str] = Field(
+        ..., min_length=1, max_length=64,
+        description="Allowed colors (hex or CSS names); every opaque pixel snaps to the nearest one",
+    )
+
+
+class OutlineInput(CanvasOp):
+    color: str = Field(default="#000000", description="Outline color")
+    corners: bool = Field(
+        default=False,
+        description="Also outline diagonal (8-neighbor) contact — thicker, rounder result",
+    )
+
+
+class OnionViewInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Current frame canvas path ending in .png")
+    previous_paths: List[str] = Field(
+        ..., min_length=1, max_length=3,
+        description="Earlier frames, most recent first; drawn as fading ghosts under the current frame",
+    )
+    tint: Optional[str] = Field(
+        default=None,
+        description="Optional color for ghost silhouettes (e.g. '#ff00ff'); omit to show dimmed originals",
+    )
+    scale: Optional[int] = Field(
+        default=None, ge=1, le=64,
+        description="Display scale; omit to auto-fit to ~512px",
+    )
+
+
+class ViewFramesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    frame_paths: List[str] = Field(
+        ..., min_length=1, max_length=64,
+        description="Same-size canvas PNGs to lay out as a filmstrip, in order",
+    )
+    columns: Optional[int] = Field(default=None, ge=1, description="Frames per row; omit for a single row")
+    scale: Optional[int] = Field(
+        default=None, ge=1, le=MAX_SCALE,
+        description="Display scale; omit to auto-fit the strip to ~1024px wide",
+    )
+
+
+class SliceSpritesheetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Spritesheet PNG to slice")
+    frame_width: int = Field(..., ge=1, le=MAX_DIM, description="Width of each frame in pixels")
+    frame_height: int = Field(..., ge=1, le=MAX_DIM, description="Height of each frame in pixels")
+    out_dir: str = Field(..., description="Directory to write frame PNGs into (created if missing)")
+    prefix: str = Field(
+        default="frame", pattern=r"^[A-Za-z0-9_-]+$",
+        description="Output filename prefix; frames are written as '<prefix>_f00.png', '<prefix>_f01.png', ...",
+    )
+    skip_empty: bool = Field(default=True, description="Skip fully transparent tiles")
+    overwrite: bool = Field(default=False, description="Replace existing frame files")
+
+
+# ---------------------------------------------------------------------------
+# Tools: animation workflow
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="pixel_duplicate_canvas",
+    annotations={
+        "title": "Duplicate Canvas",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_duplicate_canvas(params: DuplicateCanvasInput) -> str:
+    """Copy a canvas to a new file — the standard way to start the next
+    animation frame from the current one, then edit only what moves.
+
+    Refuses to replace an existing file unless overwrite=true. Returns JSON
+    {"source", "canvas", "width", "height"}. On failure returns "Error: ...".
+    """
+    try:
+        _, img = _load(params.path)
+        dest = _resolve(params.dest_path, must_exist=False)
+        if dest.exists() and not params.overwrite:
+            return f"Error: '{dest}' already exists. Pass overwrite=true to replace it."
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        img.save(dest)
+        return json.dumps({
+            "source": params.path,
+            "canvas": str(dest),
+            "width": img.width,
+            "height": img.height,
+        }, indent=2)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_copy_region",
+    annotations={
+        "title": "Copy Region",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_copy_region(params: CopyRegionInput) -> Any:
+    """Copy a rectangular region from one canvas onto another (or within the
+    same canvas) — for moving limbs between frames, stamping repeated parts,
+    or compositing a sprite onto a background.
+
+    mode='over' (default) respects transparency like layering; mode='replace'
+    overwrites the destination rect including alpha. Destination coordinates
+    may be negative or overhang; the region clips to the destination canvas.
+    Returns JSON {"source", "canvas", "region", "pasted_at", "mode"}; plus a
+    rendered image of the destination when preview=true. On failure returns
+    "Error: ...".
+    """
+    try:
+        src_p, src = _load(params.path)
+        if params.x + params.width > src.width or params.y + params.height > src.height:
+            return (
+                f"Error: region {params.width}x{params.height} at ({params.x},{params.y}) "
+                f"exceeds the {src.width}x{src.height} source canvas."
+            )
+        region = src.crop((params.x, params.y, params.x + params.width, params.y + params.height))
+
+        if params.dest_path is None or _resolve(params.dest_path, must_exist=False) == src_p:
+            dest_p, dest = src_p, src
+        else:
+            dest_p, dest = _load(params.dest_path)
+
+        dx, dy = params.dest_x, params.dest_y
+        left_clip = max(0, -dx)
+        top_clip = max(0, -dy)
+        right = min(region.width, dest.width - dx)
+        bottom = min(region.height, dest.height - dy)
+        if left_clip >= right or top_clip >= bottom:
+            return (
+                f"Error: the region lands entirely outside the {dest.width}x{dest.height} "
+                "destination canvas."
+            )
+        region = region.crop((left_clip, top_clip, right, bottom))
+        at = (dx + left_clip, dy + top_clip)
+        if params.mode == PasteMode.OVER:
+            dest.alpha_composite(region, at)
+        else:
+            dest.paste(region, at)
+        dest.save(dest_p)
+        payload = {
+            "source": str(src_p),
+            "canvas": str(dest_p),
+            "region": f"{params.width}x{params.height} from ({params.x},{params.y})",
+            "pasted_at": f"({at[0]},{at[1]})",
+            "mode": params.mode.value,
+        }
+        return _result(payload, dest, params.preview)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_shift_canvas",
+    annotations={
+        "title": "Shift Canvas",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_shift_canvas(params: ShiftCanvasInput) -> Any:
+    """Shift the whole canvas by (dx, dy) pixels — quick motion between
+    animation frames (bobbing, jumping, sliding).
+
+    Without wrap, pixels shifted past the edge are lost and vacated space is
+    transparent; with wrap=true they re-enter from the opposite edge (good for
+    scrolling backgrounds). Returns JSON {"canvas", "shift", "wrap"}; plus a
+    rendered image when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        if params.wrap:
+            img = ImageChops.offset(img, params.dx, params.dy)
+        else:
+            shifted = PILImage.new("RGBA", img.size, (0, 0, 0, 0))
+            shifted.paste(img, (params.dx, params.dy))
+            img = shifted
+        img.save(p)
+        payload = {"canvas": str(p), "shift": f"({params.dx},{params.dy})", "wrap": params.wrap}
+        return _result(payload, img, params.preview)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_resize_canvas",
+    annotations={
+        "title": "Resize Canvas Bounds",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_resize_canvas(params: ResizeCanvasInput) -> Any:
+    """Change the canvas bounds without scaling the art — grow the canvas
+    (new space is transparent) or crop it, with the existing art held at the
+    chosen anchor.
+
+    Pixel sizes are unchanged; use pixel_scale_canvas to actually rescale art.
+    Example: after squashing a sprite, resize back to the original height with
+    anchor='bottom' to keep it grounded. Returns JSON {"canvas", "width",
+    "height", "anchor"}; plus a rendered image when preview=true. On failure
+    returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        fx, fy = _ANCHOR_FRACTIONS[params.anchor]
+        offset = (round((params.width - img.width) * fx), round((params.height - img.height) * fy))
+        resized = PILImage.new("RGBA", (params.width, params.height), (0, 0, 0, 0))
+        resized.paste(img, offset)
+        resized.save(p)
+        payload = {
+            "canvas": str(p),
+            "width": params.width,
+            "height": params.height,
+            "anchor": params.anchor.value,
+        }
+        return _result(payload, resized, params.preview)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_scale_canvas",
+    annotations={
+        "title": "Scale Canvas Art",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_scale_canvas(params: ScaleCanvasInput) -> Any:
+    """Rescale the canvas and its art to new dimensions with nearest-neighbor
+    sampling (no blurring).
+
+    Integer multiples or divisors keep pixels perfectly crisp; other ratios
+    will distort — useful deliberately for squash-and-stretch animation
+    frames. Returns JSON {"canvas", "width", "height"}; plus a rendered image
+    when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        scaled = img.resize((params.width, params.height), PILImage.Resampling.NEAREST)
+        scaled.save(p)
+        payload = {"canvas": str(p), "width": scaled.width, "height": scaled.height}
+        return _result(payload, scaled, params.preview)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_apply_palette",
+    annotations={
+        "title": "Apply Palette",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_apply_palette(params: ApplyPaletteInput) -> Any:
+    """Snap every opaque pixel to the nearest color in a given palette —
+    enforce a consistent game palette across sprites or clean up stray colors.
+
+    Nearest match is by RGB distance; each pixel's alpha is preserved and
+    fully transparent pixels are untouched. Returns JSON {"canvas",
+    "palette_size", "pixels_changed"}; plus a rendered image when
+    preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        palette = [_parse_color(c)[:3] for c in params.palette]
+
+        def nearest(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+            return min(palette, key=lambda c: (c[0] - rgb[0]) ** 2 + (c[1] - rgb[1]) ** 2 + (c[2] - rgb[2]) ** 2)
+
+        mapping: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+        data = list(img.getdata())
+        out = []
+        changed = 0
+        for px in data:
+            if px[3] == 0:
+                out.append(px)
+                continue
+            rgb = px[:3]
+            new = mapping.get(rgb)
+            if new is None:
+                new = nearest(rgb)
+                mapping[rgb] = new
+            if new != rgb:
+                changed += 1
+            out.append((new[0], new[1], new[2], px[3]))
+        img.putdata(out)
+        img.save(p)
+        payload = {"canvas": str(p), "palette_size": len(palette), "pixels_changed": changed}
+        return _result(payload, img, params.preview)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_outline_sprite",
+    annotations={
+        "title": "Outline Sprite",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_outline_sprite(params: OutlineInput) -> Any:
+    """Draw a 1px outline around all opaque art on the canvas — the classic
+    finishing pass that makes sprites pop against any background.
+
+    The outline occupies transparent pixels adjacent to the art; the art
+    itself is untouched. If the sprite touches the canvas edge, grow the
+    canvas first with pixel_resize_canvas so the outline has room. Returns
+    JSON {"canvas", "color", "pixels_outlined"}; plus a rendered image when
+    preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        color = _parse_color(params.color)
+        mask = img.getchannel("A").point(lambda a: 255 if a > 0 else 0)
+        ring = ImageChops.subtract(_dilate(mask, params.corners), mask)
+        outlined = sum(1 for v in ring.getdata() if v)
+        if outlined == 0:
+            return (
+                "Error: nothing to outline — the canvas is either empty or fully opaque. "
+                "Outlines are drawn on transparent pixels next to opaque art."
+            )
+        img.paste(color, mask=ring)
+        img.save(p)
+        payload = {"canvas": str(p), "color": _color_hex(color), "pixels_outlined": outlined}
+        return _result(payload, img, params.preview)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_onion_view",
+    annotations={
+        "title": "Onion-Skin View",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_onion_view(params: OnionViewInput) -> Any:
+    """Render the current frame over faded ghosts of up to 3 earlier frames —
+    onion-skinning, the standard way to judge motion between animation frames.
+
+    List previous_paths most-recent first; ghosts fade with distance (35%,
+    20%, 12% opacity). Pass a tint color to show ghosts as silhouettes when
+    frame colors overlap too much. Nothing is written to disk. Returns a text
+    summary plus the rendered image. On failure returns "Error: ...".
+    """
+    try:
+        frames = _load_frames([params.path] + params.previous_paths)
+        current, ghosts = frames[0], frames[1:]
+        tint = _parse_color(params.tint) if params.tint else None
+        opacities = [0.35, 0.20, 0.12]
+        composite = PILImage.new("RGBA", current.size, (0, 0, 0, 0))
+        for frame, opacity in reversed(list(zip(ghosts, opacities))):
+            composite.alpha_composite(_ghost(frame, opacity, tint))
+        composite.alpha_composite(current)
+        scale = params.scale or _auto_scale(composite)
+        summary = (
+            f"{Path(params.path).name} over {len(ghosts)} ghost frame(s) "
+            f"({', '.join(Path(fp).name for fp in params.previous_paths)}), shown at {scale}x"
+        )
+        return [summary, _preview_image(composite, scale)]
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_view_frames",
+    annotations={
+        "title": "View Frames Filmstrip",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_view_frames(params: ViewFramesInput) -> Any:
+    """Render several same-size canvases side by side as one filmstrip image —
+    review a whole animation or sprite set at a glance.
+
+    Frames are laid out left-to-right, top-to-bottom on a neutral gray
+    backdrop with thin separators, in the order given. Nothing is written to
+    disk. Returns a text summary naming each frame position plus the rendered
+    image. On failure returns "Error: ...".
+    """
+    try:
+        frames = _load_frames(params.frame_paths)
+        fw, fh = frames[0].size
+        cols = min(params.columns or len(frames), len(frames))
+        rows = math.ceil(len(frames) / cols)
+        scale = params.scale or max(1, min(MAX_SCALE, 1024 // (cols * fw)))
+        gap = 2
+        cell_w, cell_h = fw * scale, fh * scale
+        sheet = PILImage.new(
+            "RGBA",
+            (cols * cell_w + (cols - 1) * gap, rows * cell_h + (rows - 1) * gap),
+            (64, 64, 64, 255),
+        )
+        for i, frame in enumerate(frames):
+            cx = (i % cols) * (cell_w + gap)
+            cy = (i // cols) * (cell_h + gap)
+            sheet.alpha_composite(_upscaled(frame, scale), (cx, cy))
+        order = " | ".join(f"{i + 1}: {Path(fp).name}" for i, fp in enumerate(params.frame_paths))
+        summary = f"{len(frames)} frames at {scale}x, {cols} per row — {order}"
+        return [summary, Image(data=_png_bytes(sheet), format="png")]
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_slice_spritesheet",
+    annotations={
+        "title": "Slice Spritesheet",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_slice_spritesheet(params: SliceSpritesheetInput) -> str:
+    """Split a spritesheet PNG into individual frame canvases — the way to
+    bring existing game assets in for editing or re-animation.
+
+    Tiles are read left-to-right, top-to-bottom on a strict frame_width x
+    frame_height grid (partial tiles at the right/bottom edges are ignored)
+    and written to out_dir as '<prefix>_f00.png', '<prefix>_f01.png', ....
+    Fully transparent tiles are skipped unless skip_empty=false. Returns JSON
+    {"source", "out_dir", "frames_written", "skipped_empty", "frame_paths"}.
+    On failure returns "Error: ...".
+    """
+    try:
+        _, sheet = _load(params.path)
+        cols = sheet.width // params.frame_width
+        rows = sheet.height // params.frame_height
+        if cols == 0 or rows == 0:
+            return (
+                f"Error: frame size {params.frame_width}x{params.frame_height} is larger than "
+                f"the {sheet.width}x{sheet.height} sheet."
+            )
+        if cols * rows > MAX_FRAMES:
+            return (
+                f"Error: {cols}x{rows} grid is {cols * rows} tiles (max {MAX_FRAMES}). "
+                "Check the frame size — it is probably smaller than the sheet's real tiles."
+            )
+        out_dir = Path(params.out_dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written: list[str] = []
+        skipped = 0
+        for row in range(rows):
+            for col in range(cols):
+                tile = sheet.crop((
+                    col * params.frame_width,
+                    row * params.frame_height,
+                    (col + 1) * params.frame_width,
+                    (row + 1) * params.frame_height,
+                ))
+                if params.skip_empty and tile.getchannel("A").getbbox() is None:
+                    skipped += 1
+                    continue
+                dest = out_dir / f"{params.prefix}_f{len(written):02d}.png"
+                if dest.exists() and not params.overwrite:
+                    return (
+                        f"Error: '{dest}' already exists. Pass overwrite=true to replace "
+                        "existing frames, or use a different prefix/out_dir."
+                    )
+                tile.save(dest)
+                written.append(str(dest))
+        if not written:
+            return "Error: every tile in the sheet was fully transparent; nothing was written."
+        return json.dumps({
+            "source": params.path,
+            "out_dir": str(out_dir),
+            "frames_written": len(written),
+            "skipped_empty": skipped,
+            "frame_paths": written,
         }, indent=2)
     except Exception as exc:
         return _error(exc)
