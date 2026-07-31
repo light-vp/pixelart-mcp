@@ -639,10 +639,15 @@ STAGE 6 — FINISH.
   interior=false under ~32px). pixel_canvas_info: too many stray colors ->
   pixel_apply_palette with your ramps. Final pixel_view_canvas at high scale.
 
-TOKEN DISCIPLINE. Every stage: describe the shape, don't enumerate pixels.
-  polygon/curve/gradient/shade/paint_grid each replace tens to hundreds of
-  single-pixel calls. While iterating on a detail, pass preview_diff=true so
-  you get back just the changed region instead of the whole canvas.
+TOKEN DISCIPLINE — two rules, both worth more than they look.
+  1. BATCH EACH STAGE. Send a whole stage as ONE pixel_batch call rather than
+     one call per operation: every separate call re-sends the conversation so
+     far, so 25 calls cost far more than 25 operations inside 4 calls. Plan the
+     stage, batch it, then view once.
+  2. DESCRIBE SHAPES, DON'T ENUMERATE PIXELS. polygon/curve/gradient/shade/
+     paint_grid each replace tens to hundreds of single-pixel placements.
+  While iterating on one detail, pass preview_diff=true to get back just the
+  changed region instead of the whole canvas.
 
 Symmetric subject? Draw the left half through stage 5, pixel_mirror_canvas,
 then break symmetry (weapon, pose, lighting on one side).""",

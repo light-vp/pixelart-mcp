@@ -28,6 +28,7 @@ on-demand technique guide (`pixel_guide`) with a staged workflow
 | `pixel_draw_polygon` | Angular silhouettes from a handful of vertices (hulls, roofs, blades, mountains) |
 | `pixel_draw_curve` | Quadratic/cubic Bézier strokes for organic contours (necks, tails, hair, flames) |
 | `pixel_apply_spaa` | Sub-pixel anti-aliasing: softens diagonal staircases; uses partial alpha on transparent backgrounds |
+| `pixel_batch` | Run many drawing operations on one canvas in a single call — the default way to draw |
 
 ### Drawing
 
@@ -86,15 +87,37 @@ workflow in `pixel_guide` (silhouette → flats → shading → details → fini
 mirrors how pixel artists actually construct a piece, and `pixel_apply_spaa` is
 the hand-finishing pass at the end.
 
+## Token cost
+
+A finished piece is 20–30 operations. The dominant cost is not the tool schemas
+(~18k tokens, sent once and cached by the client) but the **round trips** — every
+separate call re-sends the whole conversation. So:
+
+- **`pixel_batch` is the default way to draw.** Send a whole stage as one call.
+  Operations run in order, share the batch's `path`, and produce output
+  byte-identical to running them individually.
+- **`preview_diff: true`** returns only the region a call changed, rendered
+  small — roughly 90% fewer image tokens while iterating on a detail.
+- **High-level tools over pixel lists.** One `pixel_draw_polygon` can place
+  thousands of pixels that would otherwise be enumerated by hand.
+- **`pixel_canvas_info`** takes `top_n` to trim its palette report.
+
+Client-side knobs matter too and are worth setting: prompt caching (tool schemas
+are a stable prefix, so they cache well) and per-session tool allow-listing.
+Deliberately *not* done here: compressing the tool descriptions. They carry the
+craft guidance — light direction, material recipes, when to dither — that lets
+smaller models draw well, so shrinking them trades quality for tokens the client
+is already caching.
+
 ## Benchmarks
 
-[benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md) defines 15 standard
+[benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md) defines 20 standard
 subjects (detailed apple, glass bottle with water, medieval knight, Spider-Man,
-Iron Man in sunlight, campfire, dragon, ...) with per-subject must-haves and a
-7-dimension rubric — run them across models or server versions to measure
-whether a tooling change actually improves the art. `benchmarks/examples/`
-holds reference pieces drawn with the craft toolset, with the scripts that
-produced them.
+Iron Man in sunlight, campfire, dragon, ice cave, ...) with per-subject
+must-haves and a 7-dimension rubric — run them across models or server versions
+to measure whether a tooling change actually improves the art.
+`benchmarks/examples/` holds reference pieces drawn with the craft toolset, and
+`benchmarks/runs/` holds completed runs with the script for every piece.
 
 ## Setup
 

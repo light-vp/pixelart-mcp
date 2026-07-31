@@ -325,6 +325,10 @@ class InfoInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     path: str = Field(..., description="Canvas file path ending in .png")
+    top_n: int = Field(
+        default=8, ge=1, le=PALETTE_TOP_N,
+        description=f"How many of the most-used colors to list (1-{PALETTE_TOP_N})",
+    )
 
 
 class ExportPngInput(BaseModel):
@@ -758,7 +762,7 @@ async def pixel_canvas_info(params: InfoInput) -> str:
                 "color": "transparent" if rgba[3] == 0 else _color_hex(rgba),
                 "count": count,
             }
-            for count, rgba in colors[:PALETTE_TOP_N]
+            for count, rgba in colors[:params.top_n]
         ]
         payload = {
             "canvas": str(p),
@@ -1781,6 +1785,46 @@ class MirrorInput(CanvasOp):
     )
 
 
+MAX_BATCH_OPS = 128
+
+
+class BatchOperation(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    op: str = Field(
+        ...,
+        description="Operation name without the 'pixel_' prefix, e.g. 'draw_rect', "
+                    "'paint_grid', 'shade_region'. See pixel_batch's docstring for the list.",
+    )
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="That operation's arguments, minus 'path' (the batch supplies it) and "
+                    "minus preview flags (ignored per-op).",
+    )
+
+
+class BatchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Canvas every operation applies to; must end in .png")
+    operations: List[BatchOperation] = Field(
+        ..., min_length=1, max_length=MAX_BATCH_OPS,
+        description=f"Operations to run in order (1-{MAX_BATCH_OPS})",
+    )
+    stop_on_error: bool = Field(
+        default=True,
+        description="Stop at the first failing operation. False runs the rest and reports "
+                    "every failure — useful when operations are independent.",
+    )
+    preview: bool = Field(
+        default=False, description="Return a rendered image of the canvas after the whole batch"
+    )
+    preview_diff: bool = Field(
+        default=False,
+        description="With preview=true, show only the region the whole batch changed",
+    )
+
+
 class PalettesInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -2251,6 +2295,121 @@ async def pixel_mirror_canvas(params: MirrorInput) -> Any:
 # ---------------------------------------------------------------------------
 # Tools: reference knowledge
 # ---------------------------------------------------------------------------
+
+def _batch_registry() -> dict[str, tuple[type[BaseModel], Any]]:
+    """Allow-list of operations pixel_batch may run. Explicit by design — a batch
+    never dispatches to an arbitrary attribute."""
+    return {
+        "draw_pixels": (DrawPixelsInput, pixel_draw_pixels),
+        "draw_line": (DrawLineInput, pixel_draw_line),
+        "draw_rect": (DrawRectInput, pixel_draw_rect),
+        "draw_ellipse": (DrawEllipseInput, pixel_draw_ellipse),
+        "draw_polygon": (DrawPolygonInput, pixel_draw_polygon),
+        "draw_curve": (DrawCurveInput, pixel_draw_curve),
+        "draw_gradient": (DrawGradientInput, pixel_draw_gradient),
+        "paint_grid": (PaintGridInput, pixel_paint_grid),
+        "flood_fill": (FloodFillInput, pixel_flood_fill),
+        "replace_color": (ReplaceColorInput, pixel_replace_color),
+        "shade_region": (ShadeRegionInput, pixel_shade_region),
+        "apply_palette": (ApplyPaletteInput, pixel_apply_palette),
+        "outline_sprite": (OutlineInput, pixel_outline_sprite),
+        "apply_spaa": (SpaaInput, pixel_apply_spaa),
+        "mirror_canvas": (MirrorInput, pixel_mirror_canvas),
+        "copy_region": (CopyRegionInput, pixel_copy_region),
+        "shift_canvas": (ShiftCanvasInput, pixel_shift_canvas),
+        "transform_canvas": (TransformInput, pixel_transform_canvas),
+        "resize_canvas": (ResizeCanvasInput, pixel_resize_canvas),
+        "scale_canvas": (ScaleCanvasInput, pixel_scale_canvas),
+    }
+
+
+@mcp.tool(
+    name="pixel_batch",
+    annotations={
+        "title": "Batch Draw",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_batch(params: BatchInput) -> Any:
+    """Run many drawing operations on one canvas in a single call.
+
+    THE DEFAULT WAY TO DRAW. A finished piece is 20-30 operations; sending them
+    one per call re-sends the whole conversation each time, so batching a stage
+    (silhouette, flats, details) into one call is where the real token saving
+    is. Operations run in order and share the batch's `path`, so you never
+    repeat it.
+
+    Each entry is {"op": "<name>", "params": {...}} where <name> is a tool name
+    without the 'pixel_' prefix: draw_pixels, draw_line, draw_rect, draw_ellipse,
+    draw_polygon, draw_curve, draw_gradient, paint_grid, flood_fill,
+    replace_color, shade_region, apply_palette, outline_sprite, apply_spaa,
+    mirror_canvas, copy_region, shift_canvas, transform_canvas, resize_canvas,
+    scale_canvas. Omit 'path' and preview flags from params.
+
+    Example: [{"op": "draw_ellipse", "params": {"x": 4, "y": 4, "width": 24,
+    "height": 24, "color": "#c22e2e"}}, {"op": "shade_region", "params":
+    {"mode": "sphere", "light": "top_left"}}]
+
+    The response is deliberately terse — a count, not a report per operation —
+    and names only what failed. Returns JSON {"canvas", "ok", "pixels_changed",
+    "failed"?}; plus a rendered image when preview=true (preview_diff crops to
+    what the whole batch changed). On failure returns "Error: ...".
+    """
+    try:
+        p, start = _load(params.path)
+        before = start.copy()
+        registry = _batch_registry()
+
+        unknown = sorted({o.op for o in params.operations} - registry.keys())
+        if unknown:
+            return (
+                f"Error: unknown operation(s) {', '.join(unknown)}. Use a tool name without "
+                f"the 'pixel_' prefix; available: {', '.join(sorted(registry))}."
+            )
+
+        ok = 0
+        failures: list[str] = []
+        for i, entry in enumerate(params.operations):
+            model, fn = registry[entry.op]
+            args = {k: v for k, v in entry.params.items()
+                    if k not in ("preview", "preview_diff")}
+            args["path"] = str(p)
+            try:
+                parsed = model(**args)
+            except Exception as exc:
+                failures.append(f"[{i}] {entry.op}: invalid params — {exc}")
+                if params.stop_on_error:
+                    break
+                continue
+            result = await fn(parsed)
+            text = result if isinstance(result, str) else result[0]
+            if text.startswith("Error"):
+                failures.append(f"[{i}] {entry.op}: {text[7:]}")
+                if params.stop_on_error:
+                    break
+            else:
+                ok += 1
+
+        _, final = _load(params.path)
+        bands = ImageChops.difference(before, final).split()
+        mask = bands[0]
+        for band in bands[1:]:
+            mask = ImageChops.lighter(mask, band)
+        changed = sum(1 for v in mask.getdata() if v) if before.size == final.size else -1
+
+        payload: dict[str, Any] = {"canvas": str(p), "ok": ok}
+        if changed >= 0:
+            payload["pixels_changed"] = changed
+        if failures:
+            payload["failed"] = failures
+        final._pixelart_before = before  # type: ignore[attr-defined]
+        return _result(payload, final, params.preview, params.preview_diff)
+    except Exception as exc:
+        return _error(exc)
+
 
 @mcp.tool(
     name="pixel_palettes",
