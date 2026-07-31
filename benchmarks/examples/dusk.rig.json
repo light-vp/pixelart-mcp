@@ -1,0 +1,263 @@
+{
+  "parts": [
+    {
+      "name": "backdrop",
+      "x": 0,
+      "y": 0,
+      "width": 128,
+      "height": 96,
+      "at_x": 0,
+      "at_y": 0,
+      "z": 0,
+      "anchor": "top"
+    },
+    {
+      "name": "star_a",
+      "x": 112,
+      "y": 170,
+      "width": 3,
+      "height": 3,
+      "at_x": 18,
+      "at_y": 9,
+      "z": 1,
+      "anchor": "center"
+    },
+    {
+      "name": "star_b",
+      "x": 112,
+      "y": 170,
+      "width": 3,
+      "height": 3,
+      "at_x": 47,
+      "at_y": 5,
+      "z": 1,
+      "anchor": "center"
+    },
+    {
+      "name": "star_c",
+      "x": 112,
+      "y": 170,
+      "width": 3,
+      "height": 3,
+      "at_x": 108,
+      "at_y": 12,
+      "z": 1,
+      "anchor": "center"
+    },
+    {
+      "name": "mist",
+      "x": 0,
+      "y": 156,
+      "width": 176,
+      "height": 10,
+      "at_x": 0,
+      "at_y": 52,
+      "z": 2,
+      "anchor": "top"
+    },
+    {
+      "name": "bird_a",
+      "x": 84,
+      "y": 170,
+      "width": 5,
+      "height": 3,
+      "at_x": 0,
+      "at_y": 17,
+      "z": 3,
+      "anchor": "center"
+    },
+    {
+      "name": "bird_b",
+      "x": 84,
+      "y": 170,
+      "width": 5,
+      "height": 3,
+      "at_x": 0,
+      "at_y": 26,
+      "z": 3,
+      "anchor": "center"
+    },
+    {
+      "name": "bird_pose_mid",
+      "x": 91,
+      "y": 170,
+      "width": 5,
+      "height": 3,
+      "at_x": 0,
+      "at_y": 17,
+      "z": 3,
+      "anchor": "center"
+    },
+    {
+      "name": "bird_pose_dn",
+      "x": 98,
+      "y": 170,
+      "width": 5,
+      "height": 3,
+      "at_x": 0,
+      "at_y": 17,
+      "z": 3,
+      "anchor": "center"
+    },
+    {
+      "name": "ground",
+      "x": 0,
+      "y": 96,
+      "width": 152,
+      "height": 38,
+      "at_x": 0,
+      "at_y": 58,
+      "z": 4,
+      "anchor": "top"
+    },
+    {
+      "name": "shadow",
+      "x": 117,
+      "y": 170,
+      "width": 12,
+      "height": 4,
+      "at_x": 39,
+      "at_y": 75,
+      "z": 5,
+      "anchor": "center"
+    },
+    {
+      "name": "arm_back",
+      "x": 26,
+      "y": 170,
+      "width": 4,
+      "height": 14,
+      "at_x": 38,
+      "at_y": 50,
+      "z": 6,
+      "anchor": "center"
+    },
+    {
+      "name": "leg_back",
+      "x": 38,
+      "y": 170,
+      "width": 6,
+      "height": 16,
+      "at_x": 40,
+      "at_y": 63,
+      "z": 7,
+      "anchor": "bottom"
+    },
+    {
+      "name": "leg_front",
+      "x": 46,
+      "y": 170,
+      "width": 6,
+      "height": 16,
+      "at_x": 43,
+      "at_y": 63,
+      "z": 8,
+      "anchor": "bottom"
+    },
+    {
+      "name": "torso",
+      "x": 14,
+      "y": 170,
+      "width": 10,
+      "height": 18,
+      "at_x": 40,
+      "at_y": 48,
+      "z": 9,
+      "anchor": "bottom"
+    },
+    {
+      "name": "head",
+      "x": 0,
+      "y": 170,
+      "width": 12,
+      "height": 12,
+      "at_x": 39,
+      "at_y": 38,
+      "z": 10,
+      "anchor": "center"
+    },
+    {
+      "name": "arm_front",
+      "x": 32,
+      "y": 170,
+      "width": 4,
+      "height": 14,
+      "at_x": 47,
+      "at_y": 50,
+      "z": 11,
+      "anchor": "center"
+    },
+    {
+      "name": "flame",
+      "x": 69,
+      "y": 170,
+      "width": 3,
+      "height": 5,
+      "at_x": 53,
+      "at_y": 62,
+      "z": 12,
+      "anchor": "center"
+    },
+    {
+      "name": "flame_pose_b",
+      "x": 74,
+      "y": 170,
+      "width": 3,
+      "height": 5,
+      "at_x": 53,
+      "at_y": 62,
+      "z": 12,
+      "anchor": "center"
+    },
+    {
+      "name": "flame_pose_c",
+      "x": 79,
+      "y": 170,
+      "width": 3,
+      "height": 5,
+      "at_x": 53,
+      "at_y": 62,
+      "z": 12,
+      "anchor": "center"
+    },
+    {
+      "name": "lantern",
+      "x": 54,
+      "y": 170,
+      "width": 13,
+      "height": 15,
+      "at_x": 48,
+      "at_y": 58,
+      "z": 13,
+      "anchor": "center"
+    },
+    {
+      "name": "leaf",
+      "x": 105,
+      "y": 170,
+      "width": 5,
+      "height": 5,
+      "at_x": 0,
+      "at_y": 0,
+      "z": 14,
+      "anchor": "center"
+    },
+    {
+      "name": "grass",
+      "x": 0,
+      "y": 136,
+      "width": 176,
+      "height": 18,
+      "at_x": 0,
+      "at_y": 78,
+      "z": 15,
+      "anchor": "top"
+    }
+  ],
+  "source": "/Users/vaibhavpatel/Desktop/Code Projects/pixelart-mcp/benchmarks/examples/dusk.png",
+  "width": 224,
+  "height": 200,
+  "frame_width": 128,
+  "frame_height": 96,
+  "notes": "Dusk Wanderer showcase"
+}

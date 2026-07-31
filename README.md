@@ -89,7 +89,15 @@ never be boxed apart — but a true side view needs them to overlap once placed.
 `at_x`/`at_y` place a binned part on the body; `frame_width`/`frame_height`
 keep the bin out of the rendered frames. See
 [`benchmarks/examples/demo_walk.py`](benchmarks/examples/demo_walk.py) for a
-complete 8-frame walk from a single 48×48 sheet.
+complete 8-frame walk from a single 48×48 sheet, and
+[`demo_dusk.py`](benchmarks/examples/demo_dusk.py) for a full 128×96 scene —
+parallax, a walking figure, a guttering lantern, flapping birds, a tumbling
+leaf and twinkling stars, all 24 frames of it composited from one 224×200
+sheet, driving every motion channel.
+
+Loops close seamlessly under two rules: layers that tile scroll **exactly one
+tile period** per loop, and sprites that don't tile **start and end
+off-frame**, so the wrap lands where nobody can see it.
 
 **No arbitrary rotation.** Pixel art does not survive being rotated by
 anything but a multiple of 90°, so the orientation channels are `flip` and
