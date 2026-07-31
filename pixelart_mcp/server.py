@@ -16,8 +16,10 @@ from typing import Any, List, Optional
 
 from mcp.server.fastmcp import FastMCP, Image
 from PIL import Image as PILImage
-from PIL import ImageChops, ImageColor, ImageDraw
+from PIL import ImageChops, ImageDraw, ImageFont
 from pydantic import BaseModel, ConfigDict, Field
+
+from pixelart_mcp import craft
 
 mcp = FastMCP("pixelart_mcp")
 
@@ -33,22 +35,8 @@ PALETTE_TOP_N = 16
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _parse_color(value: str) -> tuple[int, int, int, int]:
-    v = value.strip().lower()
-    if v in ("transparent", "none"):
-        return (0, 0, 0, 0)
-    try:
-        return ImageColor.getcolor(value, "RGBA")  # type: ignore[return-value]
-    except ValueError as exc:
-        raise ValueError(
-            f"Unrecognized color '{value}'. Use hex like '#1a1c2c' or '#1a1c2cff', "
-            "a CSS name like 'crimson', or 'transparent'."
-        ) from exc
-
-
-def _color_hex(rgba: tuple[int, int, int, int]) -> str:
-    r, g, b, a = rgba
-    return f"#{r:02x}{g:02x}{b:02x}" + (f"{a:02x}" if a != 255 else "")
+_parse_color = craft.parse_color
+_color_hex = craft.color_hex
 
 
 def _resolve(path: str, *, suffix: str = ".png", must_exist: bool) -> Path:
@@ -64,7 +52,12 @@ def _resolve(path: str, *, suffix: str = ".png", must_exist: bool) -> Path:
 
 def _load(path: str) -> tuple[Path, PILImage.Image]:
     p = _resolve(path, must_exist=True)
-    return p, PILImage.open(p).convert("RGBA")
+    img = PILImage.open(p).convert("RGBA")
+    # Stash a pristine copy so preview_diff can crop to what actually changed.
+    # Tools that rebind `img` to a new object (transform/resize/scale) lose it
+    # and fall back to a full preview — correct, since those change everything.
+    img._pixelart_before = img.copy()  # type: ignore[attr-defined]
+    return p, img
 
 
 def _png_bytes(img: PILImage.Image) -> bytes:
@@ -87,7 +80,86 @@ def _preview_image(img: PILImage.Image, scale: Optional[int] = None) -> Image:
     return Image(data=_png_bytes(_upscaled(img, scale or _auto_scale(img))), format="png")
 
 
-def _result(payload: dict, img: Optional[PILImage.Image] = None, preview: bool = False) -> Any:
+def _gridded(img: PILImage.Image, scale: int) -> PILImage.Image:
+    """Upscale and overlay gridlines + coordinate labels every 8 canvas pixels."""
+    margin = 22
+    scaled = _upscaled(img, scale).convert("RGBA")
+    out = PILImage.new("RGBA", (scaled.width + margin, scaled.height + margin), (24, 24, 30, 255))
+    # checkerboard backdrop so transparency is visible under the art
+    backdrop = PILImage.new("RGBA", scaled.size, (90, 90, 96, 255))
+    bd = ImageDraw.Draw(backdrop)
+    cell = max(4, scale // 2)
+    for by in range(0, scaled.height, cell):
+        for bx in range(0, scaled.width, cell):
+            if (bx // cell + by // cell) % 2 == 0:
+                bd.rectangle([bx, by, bx + cell - 1, by + cell - 1], fill=(112, 112, 118, 255))
+    backdrop.alpha_composite(scaled)
+    out.paste(backdrop, (margin, margin))
+    overlay = PILImage.new("RGBA", out.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default()
+    if scale >= 4:
+        for cx in range(img.width + 1):
+            x = margin + cx * scale
+            major = cx % 8 == 0
+            draw.line([(x, margin), (x, out.height - 1)],
+                      fill=(255, 255, 255, 90 if major else 36), width=1)
+        for cy in range(img.height + 1):
+            y = margin + cy * scale
+            major = cy % 8 == 0
+            draw.line([(margin, y), (out.width - 1, y)],
+                      fill=(255, 255, 255, 90 if major else 36), width=1)
+    for cx in range(0, img.width, 8):
+        draw.text((margin + cx * scale + 2, 4), str(cx), fill=(220, 220, 230, 255), font=font)
+    for cy in range(0, img.height, 8):
+        draw.text((3, margin + cy * scale + 1), str(cy), fill=(220, 220, 230, 255), font=font)
+    return PILImage.alpha_composite(out, overlay)
+
+
+DIFF_PAD = 2
+DIFF_FULL_FRACTION = 0.7  # a diff this large is not worth cropping
+DIFF_VIEW_TARGET = 160  # diffs render small on purpose — that is the token saving
+
+
+def _diff_view(img: PILImage.Image) -> Optional[tuple[PILImage.Image, str]]:
+    """Crop to the region this operation changed, for a cheap preview.
+
+    Returns (cropped_image, label), or None to fall back to a full preview.
+    """
+    before = getattr(img, "_pixelart_before", None)
+    if before is None or before.size != img.size:
+        return None
+    # getbbox() on RGBA looks only at alpha, so a color-only edit would read as
+    # empty; flatten the per-channel differences into one L mask first.
+    bands = ImageChops.difference(before, img).split()
+    mask = bands[0]
+    for band in bands[1:]:
+        mask = ImageChops.lighter(mask, band)
+    bbox = mask.getbbox()
+    if bbox is None:
+        return img.crop((0, 0, min(8, img.width), min(8, img.height))), "no pixels changed"
+    x0 = max(0, bbox[0] - DIFF_PAD)
+    y0 = max(0, bbox[1] - DIFF_PAD)
+    x1 = min(img.width, bbox[2] + DIFF_PAD)
+    y1 = min(img.height, bbox[3] + DIFF_PAD)
+    if (x1 - x0) * (y1 - y0) > img.width * img.height * DIFF_FULL_FRACTION:
+        return None
+    return img.crop((x0, y0, x1, y1)), f"changed region ({x0},{y0})-({x1 - 1},{y1 - 1})"
+
+
+def _result(
+    payload: dict,
+    img: Optional[PILImage.Image] = None,
+    preview: bool = False,
+    preview_diff: bool = False,
+) -> Any:
+    if preview and img is not None and preview_diff:
+        diff = _diff_view(img)
+        if diff is not None:
+            cropped, label = diff
+            payload = {**payload, "preview": label}
+            scale = max(1, min(16, DIFF_VIEW_TARGET // max(cropped.width, cropped.height)))
+            return [json.dumps(payload, indent=2), _preview_image(cropped, scale)]
     text = json.dumps(payload, indent=2)
     if preview and img is not None:
         return [text, _preview_image(img)]
@@ -131,6 +203,12 @@ class CanvasOp(BaseModel):
     preview: bool = Field(
         default=False,
         description="If true, also return a rendered image of the canvas after this operation.",
+    )
+    preview_diff: bool = Field(
+        default=False,
+        description="With preview=true, show only the region this call changed instead of the "
+                    "whole canvas — far cheaper for small edits on a big canvas. Falls back to "
+                    "the full canvas when the change is large.",
     )
 
 
@@ -236,6 +314,11 @@ class ViewInput(BaseModel):
         default=None, ge=1, le=64,
         description="Nearest-neighbor display scale; omit to auto-fit to ~512px",
     )
+    grid: bool = Field(
+        default=False,
+        description="Overlay pixel gridlines with coordinate labels every 8px — "
+                    "use when planning precise pixel placement",
+    )
 
 
 class InfoInput(BaseModel):
@@ -328,7 +411,7 @@ async def pixel_create_canvas(params: CreateCanvasInput) -> Any:
             "height": params.height,
             "background": _color_hex(bg) if bg[3] else "transparent",
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -384,7 +467,7 @@ async def pixel_draw_pixels(params: DrawPixelsInput) -> Any:
         payload: dict[str, Any] = {"canvas": str(p), "pixels_drawn": drawn}
         if skipped:
             payload["skipped_out_of_bounds"] = skipped
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -420,7 +503,7 @@ async def pixel_draw_line(params: DrawLineInput) -> Any:
             "line": f"({params.x0},{params.y0}) -> ({params.x1},{params.y1})",
             "color": _color_hex(color),
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -459,7 +542,7 @@ async def pixel_draw_rect(params: DrawRectInput) -> Any:
             "color": _color_hex(color),
             "filled": params.filled,
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -498,7 +581,7 @@ async def pixel_draw_ellipse(params: DrawEllipseInput) -> Any:
             "color": _color_hex(color),
             "filled": params.filled,
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -535,7 +618,7 @@ async def pixel_flood_fill(params: FloodFillInput) -> Any:
             "seed": f"({params.x},{params.y})",
             "color": _color_hex(color),
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -576,7 +659,7 @@ async def pixel_replace_color(params: ReplaceColorInput) -> Any:
             "replace": _color_hex(replace),
             "pixels_changed": changed,
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -609,7 +692,7 @@ async def pixel_transform_canvas(params: TransformInput) -> Any:
             "width": img.width,
             "height": img.height,
         }
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -640,6 +723,9 @@ async def pixel_view_canvas(params: ViewInput) -> Any:
         p, img = _load(params.path)
         scale = params.scale or _auto_scale(img)
         summary = f"{p.name}: {img.width}x{img.height} canvas, shown at {scale}x"
+        if params.grid:
+            summary += " with an 8px coordinate grid"
+            return [summary, Image(data=_png_bytes(_gridded(img, scale)), format="png")]
         return [summary, _preview_image(img, scale)]
     except Exception as exc:
         return _error(exc)
@@ -938,11 +1024,21 @@ class ApplyPaletteInput(CanvasOp):
     )
 
 
+class OutlineMode(str, Enum):
+    SOLID = "solid"
+    SELECTIVE = "selective"
+
+
 class OutlineInput(CanvasOp):
-    color: str = Field(default="#000000", description="Outline color")
+    color: str = Field(default="#000000", description="Outline color (used by mode='solid')")
     corners: bool = Field(
         default=False,
         description="Also outline diagonal (8-neighbor) contact — thicker, rounder result",
+    )
+    mode: OutlineMode = Field(
+        default=OutlineMode.SOLID,
+        description="'solid' uses one color; 'selective' colors each outline pixel a "
+                    "darkened, cooled version of the art it touches (softer, pro look)",
     )
 
 
@@ -1091,7 +1187,7 @@ async def pixel_copy_region(params: CopyRegionInput) -> Any:
             "pasted_at": f"({at[0]},{at[1]})",
             "mode": params.mode.value,
         }
-        return _result(payload, dest, params.preview)
+        return _result(payload, dest, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -1125,7 +1221,7 @@ async def pixel_shift_canvas(params: ShiftCanvasInput) -> Any:
             img = shifted
         img.save(p)
         payload = {"canvas": str(p), "shift": f"({params.dx},{params.dy})", "wrap": params.wrap}
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -1164,7 +1260,7 @@ async def pixel_resize_canvas(params: ResizeCanvasInput) -> Any:
             "height": params.height,
             "anchor": params.anchor.value,
         }
-        return _result(payload, resized, params.preview)
+        return _result(payload, resized, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -1193,7 +1289,7 @@ async def pixel_scale_canvas(params: ScaleCanvasInput) -> Any:
         scaled = img.resize((params.width, params.height), PILImage.Resampling.NEAREST)
         scaled.save(p)
         payload = {"canvas": str(p), "width": scaled.width, "height": scaled.height}
-        return _result(payload, scaled, params.preview)
+        return _result(payload, scaled, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -1243,7 +1339,7 @@ async def pixel_apply_palette(params: ApplyPaletteInput) -> Any:
         img.putdata(out)
         img.save(p)
         payload = {"canvas": str(p), "palette_size": len(palette), "pixels_changed": changed}
-        return _result(payload, img, params.preview)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -1263,10 +1359,12 @@ async def pixel_outline_sprite(params: OutlineInput) -> Any:
     finishing pass that makes sprites pop against any background.
 
     The outline occupies transparent pixels adjacent to the art; the art
-    itself is untouched. If the sprite touches the canvas edge, grow the
-    canvas first with pixel_resize_canvas so the outline has room. Returns
-    JSON {"canvas", "color", "pixels_outlined"}; plus a rendered image when
-    preview=true. On failure returns "Error: ...".
+    itself is untouched. mode='solid' uses `color`; mode='selective' derives
+    each outline pixel from the art it touches (darker, cooler — the "sel-out"
+    style). If the sprite touches the canvas edge, grow the canvas first with
+    pixel_resize_canvas so the outline has room. Returns JSON {"canvas",
+    "mode", "pixels_outlined"}; plus a rendered image when preview=true.
+    On failure returns "Error: ...".
     """
     try:
         p, img = _load(params.path)
@@ -1279,10 +1377,41 @@ async def pixel_outline_sprite(params: OutlineInput) -> Any:
                 "Error: nothing to outline — the canvas is either empty or fully opaque. "
                 "Outlines are drawn on transparent pixels next to opaque art."
             )
-        img.paste(color, mask=ring)
+        if params.mode == OutlineMode.SELECTIVE:
+            px = img.load()
+            ring_px = ring.load()
+            cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+            for y in range(img.height):
+                for x in range(img.width):
+                    if not ring_px[x, y]:
+                        continue
+                    neighbors = [
+                        px[nx, ny][:3]
+                        for nx, ny in (
+                            (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1),
+                            (x - 1, y - 1), (x + 1, y - 1), (x - 1, y + 1), (x + 1, y + 1),
+                        )
+                        if 0 <= nx < img.width and 0 <= ny < img.height and px[nx, ny][3] > 0
+                    ]
+                    if not neighbors:
+                        continue
+                    src = max(set(neighbors), key=neighbors.count)
+                    dark = cache.get(src)
+                    if dark is None:
+                        dark = craft.darken_for_outline(src)
+                        cache[src] = dark
+                    px[x, y] = dark + (255,)
+        else:
+            img.paste(color, mask=ring)
         img.save(p)
-        payload = {"canvas": str(p), "color": _color_hex(color), "pixels_outlined": outlined}
-        return _result(payload, img, params.preview)
+        payload = {
+            "canvas": str(p),
+            "mode": params.mode.value,
+            "pixels_outlined": outlined,
+        }
+        if params.mode == OutlineMode.SOLID:
+            payload["color"] = _color_hex(color)
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
     except Exception as exc:
         return _error(exc)
 
@@ -1435,5 +1564,766 @@ async def pixel_slice_spritesheet(params: SliceSpritesheetInput) -> str:
             "skipped_empty": skipped,
             "frame_paths": written,
         }, indent=2)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Input models for craft tools (color, shading, grid painting)
+# ---------------------------------------------------------------------------
+
+class BuildRampInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    color: str = Field(..., description="Base (midtone) color of the material, hex or CSS name")
+    steps: int = Field(default=5, ge=3, le=9, description="Ramp length; 5 typical, 7 for hero materials")
+    hue_shift_deg: float = Field(
+        default=18.0, ge=0.0, le=45.0,
+        description="Hue rotation per step: shadows toward blue, highlights toward warm. "
+                    "18 = natural, 25-30 = dramatic/sunny, 0 = flat tints",
+    )
+
+
+class GradientKind(str, Enum):
+    LINEAR = "linear"
+    RADIAL = "radial"
+
+
+class DitherPattern(str, Enum):
+    NONE = "none"
+    CHECKER = "checker"
+    BAYER2 = "bayer2"
+    BAYER4 = "bayer4"
+
+
+class PaintOver(str, Enum):
+    ALL = "all"
+    OPAQUE = "opaque"
+    TRANSPARENT = "transparent"
+
+
+class DrawGradientInput(CanvasOp):
+    x: int = Field(..., description="Region left edge X")
+    y: int = Field(..., description="Region top edge Y")
+    width: int = Field(..., ge=1, description="Region width in pixels")
+    height: int = Field(..., ge=1, description="Region height in pixels")
+    colors: List[str] = Field(
+        ..., min_length=2, max_length=16,
+        description="Gradient colors in order (start -> end); use a ramp from pixel_build_ramp",
+    )
+    kind: GradientKind = Field(default=GradientKind.LINEAR, description="'linear' or 'radial'")
+    angle_deg: float = Field(
+        default=90.0, ge=-360.0, le=360.0,
+        description="Linear only: gradient direction; 0 = left-to-right, 90 = top-to-bottom",
+    )
+    center_x: Optional[int] = Field(default=None, description="Radial only: center X (default region center)")
+    center_y: Optional[int] = Field(default=None, description="Radial only: center Y (default region center)")
+    radius: Optional[float] = Field(
+        default=None, gt=0,
+        description="Radial only: distance at which the last color is reached (default: to region corner)",
+    )
+    dither: DitherPattern = Field(
+        default=DitherPattern.NONE,
+        description="Blend bands with ordered dithering: 'bayer4' smoothest (skies), "
+                    "'checker' coarse retro, 'none' for hard bands",
+    )
+    paint_over: PaintOver = Field(
+        default=PaintOver.ALL,
+        description="'all' paints everything; 'opaque' only over existing art (shade a sprite); "
+                    "'transparent' only empty pixels (fill a background behind art)",
+    )
+    target: Optional[str] = Field(
+        default=None,
+        description="Only paint pixels currently of this exact color — gradient-shade one "
+                    "flat region (e.g. the water inside a bottle) without touching neighbors",
+    )
+
+
+class ShadeMode(str, Enum):
+    BEVEL = "bevel"
+    SPHERE = "sphere"
+    CYLINDER_UPRIGHT = "cylinder_upright"
+    CYLINDER_SIDE = "cylinder_side"
+
+
+class LightDirection(str, Enum):
+    TOP_LEFT = "top_left"
+    TOP = "top"
+    TOP_RIGHT = "top_right"
+    LEFT = "left"
+    RIGHT = "right"
+    BOTTOM_LEFT = "bottom_left"
+    BOTTOM = "bottom"
+    BOTTOM_RIGHT = "bottom_right"
+
+
+class ShadeRegionInput(CanvasOp):
+    mode: ShadeMode = Field(
+        ...,
+        description="'sphere' round things (fruit, heads); 'cylinder_upright' bottles/trunks/limbs; "
+                    "'cylinder_side' barrels/logs lying down; 'bevel' angular things (armor, rocks, cloth)",
+    )
+    light: LightDirection = Field(
+        default=LightDirection.TOP_LEFT,
+        description="Where the light comes FROM. Use the same value for every region of one artwork!",
+    )
+    target: Optional[str] = Field(
+        default=None,
+        description="Only shade pixels of this exact color; omit to shade every flat color "
+                    "region on the canvas independently",
+    )
+    ramp: Optional[List[str]] = Field(
+        default=None, min_length=3, max_length=9,
+        description="Explicit dark->light ramp to shade with; omit to auto-build one from "
+                    "each region's color (recommended)",
+    )
+    levels: int = Field(
+        default=2, ge=1, le=3,
+        description="Bevel only: shadow/highlight bands per side (2 = base±2 -> 5-color ramp)",
+    )
+    band_px: int = Field(default=1, ge=1, le=8, description="Bevel only: thickness of each band in pixels")
+
+
+class PaintGridInput(CanvasOp):
+    x: int = Field(default=0, description="Canvas X where the grid's left column lands")
+    y: int = Field(default=0, description="Canvas Y where the grid's top row lands")
+    rows: List[str] = Field(
+        ..., min_length=1, max_length=MAX_DIM,
+        description="The art as text, one string per pixel row; row length = width in pixels",
+    )
+    legend: dict[str, str] = Field(
+        ...,
+        description="Map from single characters used in rows to colors (hex/CSS/'transparent'). "
+                    "'.' and ' ' skip (leave the canvas untouched) unless remapped here.",
+    )
+
+
+class Point2D(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: int = Field(..., description="X coordinate")
+    y: int = Field(..., description="Y coordinate")
+
+
+class DrawPolygonInput(CanvasOp):
+    points: List[Point2D] = Field(
+        ..., min_length=3, max_length=256,
+        description="Vertices in order; the shape is closed automatically. May sit partly "
+                    "off-canvas (clips).",
+    )
+    color: str = Field(default="#000000", description="Color; 'transparent' erases")
+    filled: bool = Field(default=True, description="Fill the polygon; false draws a 1px outline")
+
+
+class DrawCurveInput(CanvasOp):
+    x0: int = Field(..., description="Start point X")
+    y0: int = Field(..., description="Start point Y")
+    x1: int = Field(..., description="End point X")
+    y1: int = Field(..., description="End point Y")
+    cx: int = Field(..., description="First control point X — the curve bends toward it")
+    cy: int = Field(..., description="First control point Y")
+    cx2: Optional[int] = Field(
+        default=None, description="Second control point X; give both cx2/cy2 for an S-curve (cubic)"
+    )
+    cy2: Optional[int] = Field(default=None, description="Second control point Y")
+    color: str = Field(default="#000000", description="Color; 'transparent' erases")
+    thickness: int = Field(default=1, ge=1, le=32, description="Stroke thickness in pixels")
+
+
+class SpaaInput(CanvasOp):
+    strength: float = Field(
+        default=0.5, ge=0.05, le=1.0,
+        description="How strongly the intermediate pixel reads: 0.5 is the classic half-tone",
+    )
+    background: Optional[str] = Field(
+        default=None,
+        description="Treat this color as the background to blend against. Omit for sprites on "
+                    "transparency — edge pixels then use partial ALPHA, which composites "
+                    "correctly over any backdrop instead of baking one in.",
+    )
+    edges: bool = Field(
+        default=True, description="Soften the outer staircase corners of the silhouette"
+    )
+    interior: bool = Field(
+        default=False,
+        description="Also smooth staircase boundaries between two flat color regions inside "
+                    "the art. Skip on sprites under ~32px — it muddies small details.",
+    )
+
+
+class AsciiViewInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(..., description="Canvas file path ending in .png")
+    x: int = Field(default=0, ge=0, description="Region left edge X")
+    y: int = Field(default=0, ge=0, description="Region top edge Y")
+    width: Optional[int] = Field(default=None, ge=1, description="Region width; omit for full canvas")
+    height: Optional[int] = Field(default=None, ge=1, description="Region height; omit for full canvas")
+
+
+class MirrorDirection(str, Enum):
+    LEFT_TO_RIGHT = "left_to_right"
+    RIGHT_TO_LEFT = "right_to_left"
+    TOP_TO_BOTTOM = "top_to_bottom"
+    BOTTOM_TO_TOP = "bottom_to_top"
+
+
+class MirrorInput(CanvasOp):
+    direction: MirrorDirection = Field(
+        ...,
+        description="Which half is the source: 'left_to_right' copies the left half, "
+                    "mirrored, onto the right half",
+    )
+    axis: Optional[int] = Field(
+        default=None, ge=0,
+        description="Column (or row) the mirror reflects across; that line stays fixed. "
+                    "Omit for the canvas center.",
+    )
+
+
+class PalettesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: Optional[str] = Field(
+        default=None,
+        description="Palette to fetch in full; omit to list all palettes with notes",
+    )
+
+
+class GuideInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    topic: Optional[str] = Field(
+        default=None,
+        description=f"One of: {', '.join(craft.GUIDE_TOPICS)}. Omit for the core workflow "
+                    "plus the topic list.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tools: color and shading craft
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="pixel_build_ramp",
+    annotations={
+        "title": "Build Color Ramp",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_build_ramp(params: BuildRampInput) -> str:
+    """Generate a professional dark->light shading ramp from one base color.
+
+    Applies standard pixel-art color theory automatically: shadows get darker,
+    more saturated, and hue-shift toward blue/violet; highlights get lighter,
+    desaturate, and shift toward warm yellow. Build one ramp per material
+    BEFORE drawing, then use only these colors. The base color sits at
+    base_index; colors below it are shadows, above it highlights. Returns JSON
+    {"ramp", "base_index", "base"}. On failure returns "Error: ...".
+    """
+    try:
+        base = _parse_color(params.color)
+        ramp, base_idx = craft.build_ramp(base, params.steps, params.hue_shift_deg)
+        return json.dumps({
+            "ramp": [_color_hex(c) for c in ramp],
+            "base_index": base_idx,
+            "base": _color_hex(base),
+        }, indent=2)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_draw_gradient",
+    annotations={
+        "title": "Draw Gradient",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_draw_gradient(params: DrawGradientInput) -> Any:
+    """Fill a rectangular region with a quantized, optionally dithered gradient.
+
+    The go-to tool for skies, glows, water, and smooth shading over large
+    areas. Pass a ramp from pixel_build_ramp as `colors`. 'linear' flows along
+    angle_deg (90 = top-to-bottom sky); 'radial' spreads from a center point
+    (glows, vignettes). dither='bayer4' gives the smoothest banding-free look.
+    paint_over='opaque' shades existing art only; 'transparent' fills the
+    empty background behind art. Including 'transparent' in `colors` makes
+    that part of the gradient leave existing pixels untouched — end a radial
+    glow with it to fade out over the background. Returns JSON {"canvas",
+    "region", "kind", "pixels_painted"}; plus a rendered image when
+    preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        colors = [_parse_color(c) for c in params.colors]
+        center = None
+        if params.center_x is not None or params.center_y is not None:
+            cx = params.center_x if params.center_x is not None else params.x + params.width // 2
+            cy = params.center_y if params.center_y is not None else params.y + params.height // 2
+            center = (float(cx), float(cy))
+        painted = craft.paint_gradient(
+            img,
+            (params.x, params.y, params.width, params.height),
+            colors,
+            params.kind.value,
+            params.angle_deg,
+            center,
+            params.radius,
+            params.dither.value,
+            params.paint_over.value,
+            _parse_color(params.target) if params.target else None,
+        )
+        if painted == 0:
+            return (
+                "Error: no pixels painted — the region is outside the canvas or the "
+                f"paint_over='{params.paint_over.value}' filter matched nothing."
+            )
+        img.save(p)
+        payload = {
+            "canvas": str(p),
+            "region": f"{params.width}x{params.height} at ({params.x},{params.y})",
+            "kind": params.kind.value,
+            "dither": params.dither.value,
+            "pixels_painted": painted,
+        }
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_shade_region",
+    annotations={
+        "title": "Auto-Shade Region",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_shade_region(params: ShadeRegionInput) -> Any:
+    """Turn flat color regions into shaded 3D-looking forms in one call.
+
+    Draw flat colors first, then shade: 'sphere' for round masses (fruit,
+    heads, orbs), 'cylinder_upright' for bottles/trunks/standing limbs,
+    'cylinder_side' for barrels/logs lying down, 'bevel' for angular surfaces
+    (armor plates, rocks, cloth) — bevel lightens bands near the lit edge and
+    darkens near the far edge. A hue-shifted ramp is auto-built from each
+    region's color unless you pass one. Keep `light` identical across all
+    calls for one artwork. Returns JSON {"canvas", "mode", "light",
+    "regions_shaded", "pixels_shaded"}; plus a rendered image when
+    preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        target = _parse_color(params.target) if params.target else None
+        explicit_ramp = [_parse_color(c) for c in params.ramp] if params.ramp else None
+        groups = craft._color_masks(img, target)
+        if not groups:
+            return (
+                "Error: nothing to shade — no opaque pixels"
+                + (f" of color {params.target}" if params.target else "")
+                + " on the canvas. Lay down flat colors first."
+            )
+        if target is None and len(groups) > 32:
+            return (
+                f"Error: {len(groups)} distinct colors on canvas — too many to shade "
+                "independently. Pass `target` to shade one color, or consolidate with "
+                "pixel_apply_palette first."
+            )
+        total = 0
+        for color, mask in groups:
+            ramp, base_idx = craft._resolve_ramp(color, explicit_ramp, params.levels)
+            if params.mode == ShadeMode.BEVEL:
+                total += craft.shade_bevel(
+                    img, mask, ramp, base_idx, params.light.value, params.levels, params.band_px
+                )
+            elif params.mode == ShadeMode.SPHERE:
+                total += craft.shade_sphere(img, mask, ramp, params.light.value)
+            else:
+                total += craft.shade_cylinder(
+                    img, mask, ramp, params.light.value,
+                    upright=params.mode == ShadeMode.CYLINDER_UPRIGHT,
+                )
+        img.save(p)
+        payload = {
+            "canvas": str(p),
+            "mode": params.mode.value,
+            "light": params.light.value,
+            "regions_shaded": len(groups),
+            "pixels_shaded": total,
+        }
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tools: text-grid drawing and reading
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="pixel_draw_polygon",
+    annotations={
+        "title": "Draw Polygon",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_draw_polygon(params: DrawPolygonInput) -> Any:
+    """Draw a filled or outlined polygon from a list of vertices.
+
+    The cheapest way to block in an angular silhouette — mountains, a ship
+    hull, a sword blade, a roof, a leaf — describing the whole shape in a
+    handful of points instead of hundreds of pixels. The outline closes
+    automatically. Combine with pixel_draw_curve for shapes that mix straight
+    runs and organic bends. Returns JSON {"canvas", "vertices", "color",
+    "filled"}; plus a rendered image when preview=true. On failure returns
+    "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        color = _parse_color(params.color)
+        draw = ImageDraw.Draw(img)
+        xy = [(pt.x, pt.y) for pt in params.points]
+        if params.filled:
+            draw.polygon(xy, fill=color)
+        else:
+            draw.polygon(xy, outline=color)
+        img.save(p)
+        payload = {
+            "canvas": str(p),
+            "vertices": len(xy),
+            "color": _color_hex(color),
+            "filled": params.filled,
+        }
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_draw_curve",
+    annotations={
+        "title": "Draw Bezier Curve",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_draw_curve(params: DrawCurveInput) -> Any:
+    """Draw a smooth Bezier curve between two points.
+
+    The tool for organic contours that lines and ellipses can't make: a
+    dragon's neck, a torso's waist, hair, a hull's sheer, flame tongues, a
+    tail. The curve bows from (x0,y0) toward the control point and on to
+    (x1,y1); supply cx2/cy2 as well for an S-curve. Sampling is automatic and
+    gap-free, so one call replaces dozens of pixel placements. Returns JSON
+    {"canvas", "from", "to", "kind", "pixels_drawn"}; plus a rendered image
+    when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        color = _parse_color(params.color)
+        cubic = params.cx2 is not None and params.cy2 is not None
+        if (params.cx2 is None) != (params.cy2 is None):
+            return "Error: give both cx2 and cy2 for a cubic curve, or neither for a quadratic."
+        pts = craft.bezier_points(
+            (params.x0, params.y0),
+            (params.cx, params.cy),
+            (params.x1, params.y1),
+            (params.cx2, params.cy2) if cubic else None,
+        )
+        draw = ImageDraw.Draw(img)
+        if len(pts) == 1:
+            draw.point(pts[0], fill=color)
+        else:
+            draw.line(pts, fill=color, width=params.thickness, joint="curve")
+        img.save(p)
+        payload = {
+            "canvas": str(p),
+            "from": f"({params.x0},{params.y0})",
+            "to": f"({params.x1},{params.y1})",
+            "kind": "cubic" if cubic else "quadratic",
+            "pixels_drawn": len(pts),
+        }
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_apply_spaa",
+    annotations={
+        "title": "Sub-Pixel Anti-Alias",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def pixel_apply_spaa(params: SpaaInput) -> Any:
+    """Soften diagonal staircase edges by placing intermediate pixels — the
+    hand-finishing pass that separates polished pixel art from blocky art.
+
+    Run it LAST, after outlining. It finds the elbow of each diagonal step and
+    fills it at partial strength, so curves and diagonals read smooth without
+    any blurring. On a transparent background it uses partial alpha rather
+    than blending into an assumed backdrop, so the sprite still anti-aliases
+    correctly over any background. Set interior=true to also smooth boundaries
+    between flat color regions inside the art (skip on sprites under ~32px).
+    Not idempotent — running it twice thickens the softening. Returns JSON
+    {"canvas", "edge_pixels", "interior_pixels", "strength"}; plus a rendered
+    image when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        bg = _parse_color(params.background) if params.background else None
+        edge_n, interior_n = craft.apply_spaa(
+            img, params.strength, bg, params.edges, params.interior
+        )
+        if edge_n == 0 and interior_n == 0:
+            return (
+                "Error: no staircase corners found to anti-alias. The art may have no "
+                "diagonal edges yet, or `background` doesn't match the actual backdrop "
+                "color (omit it for transparent backgrounds)."
+            )
+        img.save(p)
+        payload = {
+            "canvas": str(p),
+            "edge_pixels": edge_n,
+            "interior_pixels": interior_n,
+            "strength": params.strength,
+        }
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_paint_grid",
+    annotations={
+        "title": "Paint ASCII Grid",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_paint_grid(params: PaintGridInput) -> Any:
+    """Paint pixels from a text grid — the most reliable way to draw shapes.
+
+    Write the art as strings, one character per pixel, with a legend mapping
+    characters to colors. '.' and ' ' leave pixels untouched (so grids can
+    layer over existing art); map a character to 'transparent' to erase.
+    Example: rows=[".XX.", "XXXX"], legend={"X": "#b13e53"}, at (x, y).
+    Rows may be different lengths. Far better than pixel_draw_pixels for any
+    shape you can sketch as text — silhouettes, faces, patterns, texture.
+    Returns JSON {"canvas", "at", "pixels_drawn", "skipped_out_of_bounds"?};
+    plus a rendered image when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        legend: dict[str, tuple[int, int, int, int]] = {}
+        for ch, color in params.legend.items():
+            if len(ch) != 1:
+                raise ValueError(
+                    f"Legend key '{ch}' must be exactly one character."
+                )
+            legend[ch] = _parse_color(color)
+        if max(len(r) for r in params.rows) > MAX_DIM:
+            raise ValueError(f"Rows longer than {MAX_DIM} characters are not allowed.")
+        painted, skipped = craft.paint_grid(img, params.x, params.y, params.rows, legend)
+        if painted == 0:
+            return (
+                f"Error: nothing painted — all {skipped} grid cells fell outside the "
+                f"{img.width}x{img.height} canvas (grid placed at ({params.x},{params.y}))."
+                if skipped else
+                "Error: nothing painted — the grid contains only '.'/' ' skip characters."
+            )
+        img.save(p)
+        payload: dict[str, Any] = {
+            "canvas": str(p),
+            "at": f"({params.x},{params.y})",
+            "pixels_drawn": painted,
+        }
+        if skipped:
+            payload["skipped_out_of_bounds"] = skipped
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_ascii_view",
+    annotations={
+        "title": "ASCII View",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_ascii_view(params: AsciiViewInput) -> str:
+    """Read the canvas as a character grid with exact coordinates — see every
+    pixel as text instead of an image.
+
+    Rows are labeled with y, columns with an x ruler, and each color gets a
+    legend character ('.' = transparent). Use it to verify precise placement,
+    find stray pixels, or inspect art when an image view is ambiguous. Capped
+    at 16384 pixels (128x128) per view — pass a region for larger canvases.
+    Returns the grid + legend as plain text. On failure returns "Error: ...".
+    """
+    try:
+        _, img = _load(params.path)
+        w = params.width if params.width is not None else img.width - params.x
+        h = params.height if params.height is not None else img.height - params.y
+        if params.x + w > img.width or params.y + h > img.height or w < 1 or h < 1:
+            return (
+                f"Error: region {w}x{h} at ({params.x},{params.y}) exceeds the "
+                f"{img.width}x{img.height} canvas."
+            )
+        return craft.ascii_view(img, (params.x, params.y, w, h))
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_mirror_canvas",
+    annotations={
+        "title": "Mirror Half",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_mirror_canvas(params: MirrorInput) -> Any:
+    """Copy one half of the canvas onto the other, mirrored — draw half a
+    symmetric subject (faces, characters, vehicles), then mirror it.
+
+    'left_to_right' reflects the left half onto the right, etc. By default the
+    mirror line is the canvas center (on odd sizes the center column/row stays
+    as-is); pass `axis` to reflect across a specific column/row instead. After
+    mirroring, break symmetry deliberately (weapon, lighting, pose). Returns
+    JSON {"canvas", "direction", "axis"}; plus a rendered image when
+    preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        horizontal = params.direction in (MirrorDirection.LEFT_TO_RIGHT, MirrorDirection.RIGHT_TO_LEFT)
+        extent = img.width if horizontal else img.height
+        axis2 = 2 * params.axis if params.axis is not None else extent - 1
+        px = img.load()
+        for y in range(img.height):
+            for x in range(img.width):
+                m = (axis2 - x, y) if horizontal else (x, axis2 - y)
+                if not (0 <= m[0] < img.width and 0 <= m[1] < img.height):
+                    continue
+                pos, mpos = (x, m[0]) if horizontal else (y, m[1])
+                if params.direction in (MirrorDirection.LEFT_TO_RIGHT, MirrorDirection.TOP_TO_BOTTOM):
+                    if pos < mpos:
+                        px[m] = px[x, y]
+                else:
+                    if pos > mpos:
+                        px[m] = px[x, y]
+        img.save(p)
+        payload = {
+            "canvas": str(p),
+            "direction": params.direction.value,
+            "axis": params.axis if params.axis is not None else (extent - 1) / 2,
+        }
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tools: reference knowledge
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="pixel_palettes",
+    annotations={
+        "title": "Curated Palettes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_palettes(params: PalettesInput) -> str:
+    """Fetch battle-tested pixel-art palettes instead of inventing colors.
+
+    Without a name: lists every palette with its character notes. With a name:
+    returns the full color list, ready to draw with and to pass to
+    pixel_apply_palette. These sets are pre-harmonized — any two colors in one
+    palette look good together. Returns JSON. On failure returns "Error: ...".
+    """
+    try:
+        if params.name is None:
+            return json.dumps({
+                "palettes": [
+                    {"name": name, "size": len(data["colors"]), "notes": data["notes"]}
+                    for name, data in craft.PALETTES.items()
+                ],
+                "tip": "Fetch one by name, or build custom ramps with pixel_build_ramp.",
+            }, indent=2)
+        data = craft.PALETTES.get(params.name.lower())
+        if data is None:
+            return (
+                f"Error: unknown palette '{params.name}'. "
+                f"Available: {', '.join(craft.PALETTES)}."
+            )
+        return json.dumps({"name": params.name.lower(), **data}, indent=2)
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_guide",
+    annotations={
+        "title": "Pixel Art Guide",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_guide(params: GuideInput) -> str:
+    """Get the pixel-art playbook — concrete technique recipes that map
+    directly onto this server's tools.
+
+    ALWAYS read topic 'workflow' before starting a new piece; it is the
+    staged process (size -> palette -> silhouette -> flats -> shading ->
+    details -> finish) that separates good sprites from mush. Other topics:
+    'sizing' (canvas size table), 'color' (ramp discipline), 'shading' (light
+    and form), 'dithering', 'materials' (metal/glass/wood/fire/...),
+    'characters', 'scenes'. On failure returns "Error: ...".
+    """
+    try:
+        if params.topic is None:
+            return (
+                craft.GUIDES["workflow"]
+                + "\n\nOther topics: "
+                + ", ".join(t for t in craft.GUIDE_TOPICS if t != "workflow")
+            )
+        topic = params.topic.lower()
+        if topic not in craft.GUIDES:
+            return (
+                f"Error: unknown topic '{params.topic}'. "
+                f"Available: {', '.join(craft.GUIDE_TOPICS)}."
+            )
+        return craft.GUIDES[topic]
     except Exception as exc:
         return _error(exc)
