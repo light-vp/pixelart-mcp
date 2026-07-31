@@ -11,13 +11,17 @@ symmetry mirroring, text-grid drawing and reading, curated palettes, and an
 on-demand technique guide (`pixel_guide`) with a staged workflow
 (size → palette → silhouette → flats → shading → details → finish).
 
+Sprites animate the same way: rig one drawing into named parts and the server
+generates the whole cycle from it, so an 8-frame walk costs one drawing rather
+than eight.
+
 ## Tools
 
 ### Craft (color, shading, knowledge)
 
 | Tool | Purpose |
 |---|---|
-| `pixel_guide` | Technique playbook: workflow, sizing, color, shading, dithering, materials, characters, scenes |
+| `pixel_guide` | Technique playbook: workflow, sizing, color, shading, dithering, materials, characters, scenes, animation |
 | `pixel_build_ramp` | One base color → professional dark→light ramp (hue-shifted shadows/highlights) |
 | `pixel_shade_region` | Flat regions → shaded 3D form in one call: `sphere`, `cylinder_upright`, `cylinder_side`, `bevel` |
 | `pixel_draw_gradient` | Linear/radial gradients with ordered dithering (`bayer4`, `checker`); can target one flat color or fade out via `transparent` |
@@ -56,12 +60,43 @@ on-demand technique guide (`pixel_guide`) with a staged workflow
 
 | Tool | Purpose |
 |---|---|
+| `pixel_define_rig` | Name the movable parts of a drawn sprite, with a labelled preview that flags art no part covers |
+| `pixel_render_motion` | Generate a whole animation loop from one rigged sprite |
+| `pixel_motions` | Built-in cycles: `walk`, `run`, `idle`, `bob`, `squash_land` |
 | `pixel_duplicate_canvas` | Start the next frame from the current one |
 | `pixel_onion_view` | Current frame over faded ghosts of up to 3 earlier frames |
 | `pixel_view_frames` | Filmstrip contact sheet of many frames in one image |
 | `pixel_export_gif` | Looping GIF with per-frame durations and ping-pong mode |
 | `pixel_export_spritesheet` | Pack frames into a grid PNG for game engines |
 | `pixel_slice_spritesheet` | Split an existing sheet back into frame canvases |
+
+#### Rigging: one drawing, N frames
+
+Nobody draws 240 frames. Draw the character **once**, name its parts, and let
+the server composite the cycle:
+
+```
+pixel_define_rig  →  pixel_render_motion motion='walk'  →  pixel_export_gif
+```
+
+Every frame is stamped from the source pixels at new offsets, and offsets round
+to whole pixels — so nothing is resampled, nothing flickers, and re-rendering
+the same rig is byte-identical. Consistency is arithmetic, not luck.
+
+Draw the limbs in a **parts bin** beside the sprite rather than on the body. A
+part is a rectangle of source pixels, so limbs drawn on top of each other can
+never be boxed apart — but a true side view needs them to overlap once placed.
+`at_x`/`at_y` place a binned part on the body; `frame_width`/`frame_height`
+keep the bin out of the rendered frames. See
+[`benchmarks/examples/demo_walk.py`](benchmarks/examples/demo_walk.py) for a
+complete 8-frame walk from a single 48×48 sheet.
+
+**No arbitrary rotation.** Pixel art does not survive being rotated by
+anything but a multiple of 90°, so the orientation channels are `flip` and
+`rot` only. For an in-between limb angle, draw that angle as its own part and
+switch to it with the `use` channel — which is how real sprite work has always
+handled it. Motion channels: `dx`, `dy`, `squash` (interpolated), `flip`,
+`rot`, `visible`, `use` (held). Read `pixel_guide topic='animation'` first.
 
 ### Inspection & export
 

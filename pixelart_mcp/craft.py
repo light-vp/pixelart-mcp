@@ -795,6 +795,62 @@ Rules of thumb:
      every standing object with a contact shadow.
   6. Readability check: pixel_view_canvas — squint; if the subject doesn't pop
      instantly, darken the background or brighten the subject's rim.""",
+
+    "animation": """ANIMATION — do NOT draw frame by frame. Draw ONE sprite, rig it,
+and let the server stamp the frames. An 8-frame walk should cost one drawing.
+
+THE LOOP:
+  1. Draw the character once, side-on, in a neutral pose. Finish it properly
+     (pixel_guide topic='workflow') — every frame is made of these exact
+     pixels, so flaws repeat 8 times.
+  2. DRAW THE LIMBS IN A PARTS BIN, not on the body. Make the canvas wider
+     than the sprite and draw arm_back/arm_front/leg_back/leg_front out to the
+     side, each clear of the others. Keep head and torso where they belong.
+     Why: a part is a RECTANGLE of source pixels, so two limbs drawn on top of
+     each other can never be boxed apart — but a side view needs them to
+     overlap once placed. Drawing them apart and placing them together is the
+     only way to get both.
+  3. pixel_define_rig — box each part, and give the binned limbs at_x/at_y for
+     where they land on the body. Set frame_width/frame_height to the sprite,
+     so the bin never shows up in a frame. Name parts head, torso, arm_back,
+     arm_front, leg_back, leg_front and the built-in motions need no wiring.
+  4. Check the preview. Magenta = drawn pixels no box covers; they vanish from
+     every frame. Fix before rendering, not after.
+  5. pixel_render_motion motion='walk' -> frames. pixel_motions lists the rest.
+  6. pixel_export_gif on the returned frame_paths. 100-125ms per frame reads
+     as walking; 60-80ms as running.
+
+RIGGING RULES that decide whether it looks right:
+  - Z-ORDER: back limbs lowest, then torso, then front limbs, head highest.
+    Shade the back limbs one ramp step darker — depth reads from value, and it
+    is what stops overlapping legs from looking like one blob.
+  - OVERLAP THE JOINTS. The torso box must run OVER the hips and shoulders by
+    2-3px. A limb swinging away from a flush-cut torso tears a visible hole;
+    an overlapping torso covers the gap for free.
+  - ANCHOR 'bottom' for legs and body (feet stay planted under squash),
+    'center' for heads and floating props.
+  - Placed boxes may overlap freely — they composite in z-order. Gaps in the
+    frame are the enemy, not overlaps.
+  - A part with no at_x/at_y renders where it was drawn. That is right for the
+    head and torso, and for simple props that only bob or float.
+
+MOTION RULES:
+  - NO ARBITRARY ROTATION. Pixel art does not survive it. You get flip (mirror)
+    and rot (90/180/270) only. For an in-between limb angle, draw that angle as
+    its own part and switch to it with the 'use' channel — part-swapping is how
+    real sprite work handles rotation.
+  - Keys are [t, value] with t in [0, 1). The cycle wraps on its own; a key at
+    t=1 is an error, not a closing frame.
+  - Offsets round to whole pixels. Amplitudes under ~2px on a 32px sprite will
+    quantize away — go bigger or use fewer frames.
+  - CONTRAST BEATS SMOOTHNESS. 8 punchy frames read better than 24 soft ones.
+    Hard cuts are the pixel-art aesthetic, not a defect to interpolate out.
+  - Opposition sells weight: arms swing against legs, body dips twice per
+    stride (lowest at contact, highest at the passing pose).
+
+MOVING A WHOLE SCENE: rig the scrolling layers as parts and drive them with
+'*' or per-layer dx at different rates — parallax for free. For a background
+that repeats, pixel_shift_canvas with wrap=true is cheaper than a rig.""",
 }
 
 GUIDE_TOPICS = list(GUIDES.keys())

@@ -1,0 +1,76 @@
+{
+  "parts": [
+    {
+      "name": "arm_back",
+      "x": 32,
+      "y": 20,
+      "width": 4,
+      "height": 13,
+      "at_x": 10,
+      "at_y": 15,
+      "z": 0,
+      "anchor": "center"
+    },
+    {
+      "name": "leg_back",
+      "x": 32,
+      "y": 0,
+      "width": 6,
+      "height": 18,
+      "at_x": 12,
+      "at_y": 28,
+      "z": 1,
+      "anchor": "bottom"
+    },
+    {
+      "name": "leg_front",
+      "x": 39,
+      "y": 0,
+      "width": 6,
+      "height": 18,
+      "at_x": 14,
+      "at_y": 28,
+      "z": 2,
+      "anchor": "bottom"
+    },
+    {
+      "name": "torso",
+      "x": 11,
+      "y": 13,
+      "width": 10,
+      "height": 18,
+      "at_x": 11,
+      "at_y": 13,
+      "z": 3,
+      "anchor": "bottom"
+    },
+    {
+      "name": "head",
+      "x": 10,
+      "y": 2,
+      "width": 12,
+      "height": 11,
+      "at_x": 10,
+      "at_y": 2,
+      "z": 4,
+      "anchor": "center"
+    },
+    {
+      "name": "arm_front",
+      "x": 38,
+      "y": 20,
+      "width": 4,
+      "height": 13,
+      "at_x": 17,
+      "at_y": 15,
+      "z": 5,
+      "anchor": "center"
+    }
+  ],
+  "source": "/Users/vaibhavpatel/Desktop/Code Projects/pixelart-mcp/benchmarks/examples/walker.png",
+  "width": 48,
+  "height": 48,
+  "frame_width": 32,
+  "frame_height": 48,
+  "notes": "side-on walker demo"
+}

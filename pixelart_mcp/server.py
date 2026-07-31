@@ -19,7 +19,7 @@ from PIL import Image as PILImage
 from PIL import ImageChops, ImageDraw, ImageFont
 from pydantic import BaseModel, ConfigDict, Field
 
-from pixelart_mcp import craft
+from pixelart_mcp import craft, rig
 
 mcp = FastMCP("pixelart_mcp")
 
@@ -46,6 +46,19 @@ def _resolve(path: str, *, suffix: str = ".png", must_exist: bool) -> Path:
     if must_exist and not p.exists():
         raise FileNotFoundError(
             f"No canvas at '{p}'. Create one with pixel_create_canvas, or check the path."
+        )
+    return p
+
+
+def _resolve_json(path: str, *, must_exist: bool) -> Path:
+    # Not _resolve(): its not-found message points at pixel_create_canvas, which
+    # is the wrong advice for a rig file.
+    p = Path(path).expanduser()
+    if p.suffix.lower() != ".json":
+        raise ValueError(f"Rig path must end with '.json', got '{path}'.")
+    if must_exist and not p.exists():
+        raise FileNotFoundError(
+            f"No rig at '{p}'. Define one with pixel_define_rig, or check the path."
         )
     return p
 
@@ -181,6 +194,30 @@ def _load_frames(frame_paths: List[str]) -> List[PILImage.Image]:
             "Resize or recreate the mismatched frames first."
         )
     return frames
+
+
+def _filmstrip(
+    frames: List[PILImage.Image],
+    columns: Optional[int] = None,
+    scale: Optional[int] = None,
+) -> tuple[PILImage.Image, int, int]:
+    """Lay same-size frames out on a neutral sheet. Returns (sheet, scale, columns)."""
+    fw, fh = frames[0].size
+    cols = min(columns or len(frames), len(frames))
+    rows = math.ceil(len(frames) / cols)
+    scale = scale or max(1, min(MAX_SCALE, 1024 // (cols * fw)))
+    gap = 2
+    cell_w, cell_h = fw * scale, fh * scale
+    sheet = PILImage.new(
+        "RGBA",
+        (cols * cell_w + (cols - 1) * gap, rows * cell_h + (rows - 1) * gap),
+        (64, 64, 64, 255),
+    )
+    for i, frame in enumerate(frames):
+        cx = (i % cols) * (cell_w + gap)
+        cy = (i // cols) * (cell_h + gap)
+        sheet.alpha_composite(_upscaled(frame, scale), (cx, cy))
+    return sheet, scale, cols
 
 
 def _to_gif_frame(img: PILImage.Image) -> PILImage.Image:
@@ -1479,21 +1516,7 @@ async def pixel_view_frames(params: ViewFramesInput) -> Any:
     """
     try:
         frames = _load_frames(params.frame_paths)
-        fw, fh = frames[0].size
-        cols = min(params.columns or len(frames), len(frames))
-        rows = math.ceil(len(frames) / cols)
-        scale = params.scale or max(1, min(MAX_SCALE, 1024 // (cols * fw)))
-        gap = 2
-        cell_w, cell_h = fw * scale, fh * scale
-        sheet = PILImage.new(
-            "RGBA",
-            (cols * cell_w + (cols - 1) * gap, rows * cell_h + (rows - 1) * gap),
-            (64, 64, 64, 255),
-        )
-        for i, frame in enumerate(frames):
-            cx = (i % cols) * (cell_w + gap)
-            cy = (i // cols) * (cell_h + gap)
-            sheet.alpha_composite(_upscaled(frame, scale), (cx, cy))
+        sheet, scale, cols = _filmstrip(frames, params.columns, params.scale)
         order = " | ".join(f"{i + 1}: {Path(fp).name}" for i, fp in enumerate(params.frame_paths))
         summary = f"{len(frames)} frames at {scale}x, {cols} per row — {order}"
         return [summary, Image(data=_png_bytes(sheet), format="png")]
@@ -2293,6 +2316,333 @@ async def pixel_mirror_canvas(params: MirrorInput) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Tools: rigging and motion
+# ---------------------------------------------------------------------------
+
+class PartAnchor(str, Enum):
+    BOTTOM = "bottom"
+    CENTER = "center"
+    TOP = "top"
+
+
+class RigPart(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ..., min_length=1,
+        description="Part name. Use head/torso/arm_back/arm_front/leg_back/leg_front "
+                    "to make the built-in motions work with no extra wiring.",
+    )
+    x: int = Field(..., ge=0, description="Box left edge in the source canvas")
+    y: int = Field(..., ge=0, description="Box top edge in the source canvas")
+    width: int = Field(..., ge=1, le=MAX_DIM, description="Box width in pixels")
+    height: int = Field(..., ge=1, le=MAX_DIM, description="Box height in pixels")
+    at_x: Optional[int] = Field(
+        default=None,
+        description="Where this part lands in the frame; defaults to x. Set at_x/at_y when "
+                    "the sprite is drawn as a parts sheet with limbs laid out separately — "
+                    "that is the only way two parts can overlap in the frame, which a true "
+                    "side view needs. May be negative.",
+    )
+    at_y: Optional[int] = Field(default=None, description="Frame Y for this part; defaults to y")
+    z: int = Field(
+        default=0,
+        description="Draw order, low first. Give the torso a higher z than the back "
+                    "limbs and overlap the hip/shoulder so moving limbs never open a gap.",
+    )
+    anchor: PartAnchor = Field(
+        default=PartAnchor.BOTTOM,
+        description="Which edge stays put when the part squashes or rotates. "
+                    "'bottom' keeps feet planted; use 'center' for heads and floating props.",
+    )
+
+
+class DefineRigInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    rig_path: str = Field(..., description="Where to save the rig; must end in .json")
+    source: str = Field(..., description="The drawn sprite this rig describes; a .png canvas path")
+    parts: List[RigPart] = Field(
+        ..., min_length=1, max_length=rig.MAX_PARTS,
+        description=f"Boxes naming each movable piece of the sprite (1-{rig.MAX_PARTS}). "
+                    "Together they should cover every drawn pixel — anything outside "
+                    "every box is dropped from every rendered frame.",
+    )
+    frame_width: Optional[int] = Field(
+        default=None, ge=1, le=MAX_DIM,
+        description="Rendered frame width; defaults to the source canvas width. Set it when "
+                    "the source is a parts sheet whose empty space should not end up in frames.",
+    )
+    frame_height: Optional[int] = Field(
+        default=None, ge=1, le=MAX_DIM, description="Rendered frame height; defaults to the source height"
+    )
+    notes: Optional[str] = Field(default=None, description="Free-text note stored with the rig")
+    overwrite: bool = Field(default=False, description="Replace the rig file if it already exists")
+    preview: bool = Field(
+        default=True,
+        description="Return the sprite with labelled part boxes drawn over it, and any "
+                    "uncovered art flagged in magenta. Keep this on — a wrong box is "
+                    "invisible in JSON and obvious in the picture.",
+    )
+    scale: Optional[int] = Field(
+        default=None, ge=1, le=64, description="Preview scale; omit to auto-fit to ~512px"
+    )
+
+
+class RenderMotionInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    rig_path: str = Field(..., description="Rig JSON describing the sprite's parts")
+    out_dir: str = Field(..., description="Directory to write frame PNGs into (created if missing)")
+    motion: Optional[str] = Field(
+        default=None,
+        description=f"Built-in motion to play: {', '.join(rig.MOTION_NAMES)}. "
+                    "See pixel_motions for what each one does.",
+    )
+    custom: Optional[dict] = Field(
+        default=None,
+        description="Inline motion, as {part_name: {channel: [[t, value], ...]}} with t in "
+                    "[0, 1) — the loop closes on its own, so never add a key at t=1. "
+                    "Channels: dx, dy, squash (interpolated, rounded to whole pixels); "
+                    "flip, rot, visible, use (held until the next key). Use '*' as a part "
+                    "name to drive every part not named individually. Merges over `motion` "
+                    "when both are given, so you can tweak one limb of a preset.",
+    )
+    frames: Optional[int] = Field(
+        default=None, ge=2, le=MAX_FRAMES,
+        description="Frames in the loop; omit to use the preset's natural count "
+                    "(8 for walk/run, 4 for idle/bob). More frames means smoother, not better — "
+                    "8-12 is the pixel-art norm.",
+    )
+    source: Optional[str] = Field(
+        default=None, description="Override the source canvas recorded in the rig"
+    )
+    prefix: str = Field(
+        default="frame", pattern=r"^[A-Za-z0-9_-]+$",
+        description="Frames are written as '<prefix>_f00.png', '<prefix>_f01.png', ...",
+    )
+    overwrite: bool = Field(default=False, description="Replace existing frame files")
+    preview: bool = Field(
+        default=True, description="Return the rendered frames as one filmstrip image"
+    )
+    columns: Optional[int] = Field(default=None, ge=1, description="Filmstrip frames per row")
+
+
+class MotionsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: Optional[str] = Field(
+        default=None,
+        description="Motion to inspect in full; omit to list them all with notes",
+    )
+
+
+@mcp.tool(
+    name="pixel_define_rig",
+    annotations={
+        "title": "Define Sprite Rig",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_define_rig(params: DefineRigInput) -> Any:
+    """Name the movable parts of a drawn sprite so it can be animated without
+    redrawing it.
+
+    A rig is a list of boxes over ONE finished sprite — draw the character
+    first, then carve it into head/torso/arms/legs. pixel_render_motion then
+    stamps those boxes at new positions to build every frame, so an 8-frame
+    walk costs one drawing instead of eight.
+
+    Two things decide whether a rig works, and both show up in the preview:
+    parts must together cover every drawn pixel (uncovered art is flagged
+    magenta and silently disappears from rendered frames), and overlapping
+    boxes must be ordered with `z` so a moving limb never tears a hole — give
+    the torso a box that runs over the hips and shoulders.
+
+    Returns JSON {"rig", "source", "parts", "uncovered_pixels"}; plus the
+    labelled preview image when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        dest = _resolve_json(params.rig_path, must_exist=False)
+        if dest.exists() and not params.overwrite:
+            return f"Error: '{dest}' already exists. Pass overwrite=true to replace it."
+        src_p, src = _load(params.source)
+
+        data: dict[str, Any] = {
+            "source": str(src_p),
+            "width": src.width,
+            "height": src.height,
+            "frame_width": params.frame_width,
+            "frame_height": params.frame_height,
+            "notes": params.notes,
+            "parts": [p.model_dump(mode="json") for p in params.parts],
+        }
+        normalized = rig.normalize_rig(data, source_size=src.size)
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(normalized, indent=2))
+
+        fw, fh = rig.frame_size(normalized, src)
+        payload: dict[str, Any] = {
+            "rig": str(dest),
+            "source": str(src_p),
+            "frame_size": f"{fw}x{fh}",
+            "parts": [
+                f"{p['name']} {p['width']}x{p['height']} from ({p['x']},{p['y']}) z{p['z']}"
+                + (f" -> ({p['at_x']},{p['at_y']})"
+                   if (p["at_x"], p["at_y"]) != (p["x"], p["y"]) else "")
+                for p in sorted(normalized["parts"], key=lambda q: q["z"])
+            ],
+        }
+        if not params.preview:
+            return json.dumps(payload, indent=2)
+
+        scale = params.scale or _auto_scale(src)
+        image, uncovered = rig.rig_preview(src, normalized, scale)
+        payload["uncovered_pixels"] = uncovered
+        if uncovered:
+            payload["warning"] = (
+                f"{uncovered} drawn pixel(s) sit outside every part box (magenta in the "
+                "preview) and will vanish from rendered frames. Widen a box or add a part."
+            )
+        return [json.dumps(payload, indent=2), Image(data=_png_bytes(image), format="png")]
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_render_motion",
+    annotations={
+        "title": "Render Motion Frames",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_render_motion(params: RenderMotionInput) -> Any:
+    """Generate a whole animation loop from one rigged sprite — the fast way
+    to animate.
+
+    Each frame is composited from the source pixels at new offsets, so every
+    frame is made of art you actually drew; only placement is computed, and it
+    is rounded to whole pixels. That means no flicker, no resampling mush, and
+    a loop that closes seamlessly.
+
+    Typical run: pixel_define_rig, then this with motion='walk', then
+    pixel_export_gif on the returned frame_paths. Start from a preset and
+    adjust with `custom` rather than authoring channels from scratch.
+
+    Frames are written to out_dir as '<prefix>_f00.png', ... and returned in
+    order. Returns JSON {"rig", "source", "motion", "frames", "out_dir",
+    "frame_paths"}; plus a filmstrip image when preview=true. On failure
+    returns "Error: ...".
+    """
+    try:
+        rig_p = _resolve_json(params.rig_path, must_exist=True)
+        rig_data = rig.load_rig(rig_p)
+
+        source = params.source or rig_data.get("source")
+        if not source:
+            return (
+                f"Error: rig '{rig_p}' records no source canvas. "
+                "Pass source=<sprite.png> explicitly."
+            )
+        src_p, src = _load(source)
+        rig_data = rig.normalize_rig(rig_data, source_size=src.size)
+
+        motion_parts, preset_frames, label = rig.resolve_motion(params.motion, params.custom)
+        count = params.frames or preset_frames or 8
+
+        driven = {n for n in motion_parts if n != "*"}
+        known = {p["name"] for p in rig_data["parts"]}
+        missing = sorted(driven - known)
+
+        out_dir = Path(params.out_dir).expanduser()
+        paths = [out_dir / f"{params.prefix}_f{i:02d}.png" for i in range(count)]
+        if not params.overwrite:
+            clashes = [p.name for p in paths if p.exists()]
+            if clashes:
+                return (
+                    f"Error: {len(clashes)} frame file(s) already exist in '{out_dir}' "
+                    f"(e.g. {clashes[0]}). Pass overwrite=true, or use a different prefix."
+                )
+
+        images = rig.render_cycle(src, rig_data, motion_parts, count)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for img, path in zip(images, paths):
+            img.save(path)
+
+        fw, fh = rig.frame_size(rig_data, src)
+        payload: dict[str, Any] = {
+            "rig": str(rig_p),
+            "source": str(src_p),
+            "motion": label,
+            "frames": count,
+            "frame_size": f"{fw}x{fh}",
+            "out_dir": str(out_dir),
+            "frame_paths": [str(p) for p in paths],
+            "next": "pixel_export_gif with these frame_paths (duration_ms 100-125 reads as walking speed)",
+        }
+        if missing:
+            payload["unused_motion_parts"] = (
+                f"The motion drives {', '.join(missing)}, which this rig has no part for — "
+                f"those channels did nothing. Rig parts: {', '.join(sorted(known))}."
+            )
+        if not params.preview:
+            return json.dumps(payload, indent=2)
+        sheet, scale, _ = _filmstrip(images, params.columns)
+        payload["preview"] = f"{count} frames at {scale}x"
+        return [json.dumps(payload, indent=2), Image(data=_png_bytes(sheet), format="png")]
+    except Exception as exc:
+        return _error(exc)
+
+
+@mcp.tool(
+    name="pixel_motions",
+    annotations={
+        "title": "Built-in Motions",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_motions(params: MotionsInput) -> str:
+    """Look up the built-in motion cycles instead of authoring keyframes by hand.
+
+    Without a name: lists every motion with its frame count and what it reads
+    as. With a name: returns the full channel data, ready to pass to
+    pixel_render_motion as `custom` and edit. Returns JSON. On failure returns
+    "Error: ...".
+    """
+    try:
+        if params.name is None:
+            return json.dumps({
+                "motions": [
+                    {"name": name, "frames": data["frames"], "notes": data["notes"],
+                     "drives": sorted(k for k in data["parts"] if k != "*") or ["* (all parts)"]}
+                    for name, data in rig.MOTIONS.items()
+                ],
+                "part_names": list(rig.CONVENTIONAL_PARTS),
+                "tip": "Name your rig parts as above and the presets just work. Fetch one by "
+                       "name to get its channels, then pass an edited copy as `custom`.",
+            }, indent=2)
+        data = rig.MOTIONS.get(params.name.lower())
+        if data is None:
+            return (
+                f"Error: unknown motion '{params.name}'. "
+                f"Available: {', '.join(rig.MOTION_NAMES)}."
+            )
+        return json.dumps({"name": params.name.lower(), **data}, indent=2)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
 # Tools: reference knowledge
 # ---------------------------------------------------------------------------
 
@@ -2468,7 +2818,8 @@ async def pixel_guide(params: GuideInput) -> str:
     details -> finish) that separates good sprites from mush. Other topics:
     'sizing' (canvas size table), 'color' (ramp discipline), 'shading' (light
     and form), 'dithering', 'materials' (metal/glass/wood/fire/...),
-    'characters', 'scenes'. On failure returns "Error: ...".
+    'characters', 'scenes', 'animation' (rig one sprite, generate the frames —
+    read before animating anything). On failure returns "Error: ...".
     """
     try:
         if params.topic is None:

@@ -1,6 +1,6 @@
 [project]
 name = "pixelart-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local pixel art MCP server: create, draw, view, and export sprites, GIFs, and spritesheets with Pillow"
 readme = "README.md"
 requires-python = ">=3.11"
