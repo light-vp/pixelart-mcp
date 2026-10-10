@@ -109,6 +109,20 @@ def darken_for_outline(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
     return _hsl_to_rgb(h, s, l * 0.45)
 
 
+def outline_color(rgb: Tuple[int, int, int], palette: Iterable[Tuple[int, int, int]]) -> Tuple[int, int, int]:
+    """Selective-outline color for art of color `rgb`, reusing a color already
+    in `palette` when one is close enough to pass for it. Without this, every
+    shade the outline touches mints its own near-identical dark, and a sprite
+    ends with a dozen outline colors nobody can tell apart."""
+    want = darken_for_outline(rgb)
+    best, best_d = None, 22.0
+    for c in palette:
+        d = color_distance(c, want)
+        if d < best_d and _luma(c) <= _luma(rgb) - 20:
+            best, best_d = c, d
+    return best if best is not None else want
+
+
 # ---------------------------------------------------------------------------
 # Ordered dithering
 # ---------------------------------------------------------------------------
@@ -232,6 +246,14 @@ def _resolve_ramp(color: RGBA, ramp_colors: Optional[List[RGBA]], levels: int) -
     return build_ramp(color, 2 * levels + 1, 18.0)
 
 
+def _resolve_form_ramp(color: RGBA, ramp_colors: Optional[List[RGBA]]) -> Tuple[List[RGBA], int]:
+    """Ramp for the form modes. An explicit ramp is used whole; an auto ramp is
+    5 steps around the region's own color, which then stays the base."""
+    if ramp_colors:
+        return ramp_colors, len(ramp_colors) // 2
+    return build_ramp(color, 5, 18.0)
+
+
 def shade_bevel(
     img: PILImage.Image,
     mask: set,
@@ -265,30 +287,118 @@ def shade_bevel(
     return changed
 
 
+def _light_vector(light: str) -> Tuple[float, float, float]:
+    """Unit vector pointing TOWARD the light (screen y down, z out of screen)."""
+    ox, oy = LIGHT_OFFSETS[light]
+    lx, ly, lz = ox * 0.8, oy * 0.8, 1.0
+    m = math.sqrt(lx * lx + ly * ly + lz * lz)
+    return lx / m, ly / m, lz / m
+
+
+def _band_shares(n: int, base_idx: int) -> List[float]:
+    """How much of a region each ramp step covers, dark -> light.
+
+    Encodes the 60/25/15 rule: the base step dominates, coverage falls off
+    with distance from it, and the light side is kept smaller than the dark
+    side so highlights stay accents. Every region shaded with the same ramp
+    length gets the same proportions — that is what keeps a piece's shading
+    consistent from one object to the next.
+    """
+    sigma = max(0.9, n / 3.2)
+    w = []
+    for i in range(n):
+        d = (i - base_idx) / sigma
+        share = math.exp(-d * d)
+        if i > base_idx:
+            share *= 0.45
+        w.append(share)
+    total = sum(w)
+    return [x / total for x in w]
+
+
+def _rank_quantize(
+    img: PILImage.Image,
+    mask: set,
+    value: Dict[Tuple[int, int], float],
+    ramp: List[RGBA],
+    base_idx: Optional[int] = None,
+) -> int:
+    """Paint the mask with ramp steps by brightness RANK, not by threshold.
+
+    The light model only decides the ORDER of pixels from darkest to lightest;
+    _band_shares decides how many land on each step. So bands always follow
+    the form's contours, and the base color always covers most of the region,
+    whatever the shape or size.
+    """
+    n = len(ramp)
+    if base_idx is None:
+        base_idx = n // 2
+    shares = _band_shares(n, base_idx)
+    order = sorted(mask, key=lambda p: (value[p], -p[1], p[0]))
+    total = len(order)
+    band: Dict[Tuple[int, int], int] = {}
+    cum = 0.0
+    idx = 0
+    bound = shares[0] * total
+    for rank, p in enumerate(order):
+        while rank >= bound and idx < n - 1:
+            idx += 1
+            cum += shares[idx - 1]
+            bound = (cum + shares[idx]) * total
+        band[p] = idx
+    _absorb_orphans(band)
+    px = img.load()
+    for (x, y), i in band.items():
+        px[x, y] = ramp[i][:3] + (px[x, y][3],)
+    return total
+
+
+def _absorb_orphans(band: Dict[Tuple[int, int], int]) -> None:
+    """A pixel sharing its band with none of its 4 neighbours reads as noise,
+    not form: fold it into the band most of its neighbours are in."""
+    for _ in range(2):
+        changes = {}
+        for (x, y), i in band.items():
+            nbs = [band[q] for q in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)) if q in band]
+            if len(nbs) < 2 or i in nbs:
+                continue
+            best = max(set(nbs), key=lambda v: (nbs.count(v), -abs(v - i)))
+            changes[(x, y)] = best
+        if not changes:
+            return
+        band.update(changes)
+
+
+def _lambert(nx: float, ny: float, nz: float, l: Tuple[float, float, float]) -> float:
+    return nx * l[0] + ny * l[1] + nz * l[2]
+
+
 def shade_sphere(
     img: PILImage.Image,
     mask: set,
     ramp: List[RGBA],
     light: str,
+    base_idx: Optional[int] = None,
 ) -> int:
-    """Radial form shading: brightest near a highlight point offset toward the
-    light, darkening toward the far rim. Good for fruit, heads, orbs."""
-    ox, oy = LIGHT_OFFSETS[light]
-    mag = math.hypot(ox, oy) or 1.0
-    cx = sum(p[0] for p in mask) / len(mask)
-    cy = sum(p[1] for p in mask) / len(mask)
-    r = max(math.hypot(x - cx, y - cy) for x, y in mask) or 1.0
-    hx = cx + (ox / mag) * r * 0.35
-    hy = cy + (oy / mag) * r * 0.35
-    n = len(ramp)
-    px = img.load()
+    """Light the region as an ellipsoid fitted to its bounding box: a lit cap
+    toward the light, a terminator, and a core shadow on the far side. Good
+    for fruit, heads, orbs."""
+    xs = [p[0] for p in mask]
+    ys = [p[1] for p in mask]
+    cx, cy = (min(xs) + max(xs) + 1) / 2.0, (min(ys) + max(ys) + 1) / 2.0
+    rx, ry = max(0.5, (max(xs) - min(xs) + 1) / 2.0), max(0.5, (max(ys) - min(ys) + 1) / 2.0)
+    lv = _light_vector(light)
+    value = {}
     for (x, y) in mask:
-        t = min(1.0, math.hypot(x - hx, y - hy) / (r * 1.35))
-        brightness = (1.0 - t) ** 1.5  # tighten the bright core; midtones dominate
-        idx = round(brightness * (n - 1))
-        a = px[x, y][3]
-        px[x, y] = ramp[idx][:3] + (a,)
-    return len(mask)
+        nx, ny = (x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry
+        r2 = nx * nx + ny * ny
+        if r2 >= 1.0:
+            r = math.sqrt(r2)
+            nx, ny, nz = nx / r, ny / r, 0.0
+        else:
+            nz = math.sqrt(1.0 - r2)
+        value[(x, y)] = _lambert(nx, ny, nz, lv)
+    return _rank_quantize(img, mask, value, ramp, base_idx)
 
 
 def shade_cylinder(
@@ -297,32 +407,93 @@ def shade_cylinder(
     ramp: List[RGBA],
     light: str,
     upright: bool,
+    base_idx: Optional[int] = None,
 ) -> int:
-    """Cylinder shading: a bright band ~30% in from the lit side, darkening
-    toward the far side. Upright = bottle/trunk (varies across x); on-side =
-    barrel/limb (varies across y)."""
-    ox, oy = LIGHT_OFFSETS[light]
-    lit_from_start = (ox < 0) if upright else (oy < 0)
-    if (upright and ox == 0) or (not upright and oy == 0):
-        lit_from_start = True
+    """Cylinder shading per row (upright: bottles, trunks, standing limbs) or
+    per column (on its side: barrels, logs). The lit band sits off-center
+    toward the light and the far edge falls into core shadow, following the
+    silhouette's own width at every row."""
     spans: Dict[int, Tuple[int, int]] = {}
     for (x, y) in mask:
         key, val = (y, x) if upright else (x, y)
         lo, hi = spans.get(key, (val, val))
         spans[key] = (min(lo, val), max(hi, val))
-    n = len(ramp)
-    px = img.load()
+    lv = _light_vector(light)
+    value = {}
     for (x, y) in mask:
         key, val = (y, x) if upright else (x, y)
         lo, hi = spans[key]
-        t = 0.5 if hi == lo else (val - lo) / (hi - lo)
-        if not lit_from_start:
-            t = 1.0 - t
-        brightness = max(0.0, min(1.0, 1.0 - abs(t - 0.28) / 0.75))
-        idx = round(brightness * (n - 1))
-        a = px[x, y][3]
-        px[x, y] = ramp[idx][:3] + (a,)
-    return len(mask)
+        half = (hi - lo + 1) / 2.0
+        u = (val + 0.5 - (lo + half)) / half  # -1..1 across the cylinder
+        u = max(-1.0, min(1.0, u))
+        across, along = u, 0.0
+        nz = math.sqrt(max(0.0, 1.0 - u * u))
+        nx, ny = (across, along) if upright else (along, across)
+        value[(x, y)] = _lambert(nx, ny, nz, lv)
+    return _rank_quantize(img, mask, value, ramp, base_idx)
+
+
+def shade_form(
+    img: PILImage.Image,
+    mask: set,
+    ramp: List[RGBA],
+    light: str,
+    base_idx: Optional[int] = None,
+) -> int:
+    """Shade ANY silhouette as a rounded volume.
+
+    Builds a height field from each pixel's distance to the region's edge,
+    domed so the rim falls off steeply, takes surface normals from its slope,
+    and lights them. Lobes, waists, and limbs each round off on their own —
+    a dragon's body, a cloud, a foliage clump or a pillow-free cloth fold
+    without fitting a primitive first.
+    """
+    dist = _edge_distance(mask)
+    peak = max(dist.values()) or 1.0
+    height = {p: math.sqrt(max(0.0, d * (2.0 * peak - d))) for p, d in dist.items()}
+    # The distance field has creases along the shape's medial axis; a couple
+    # of blur passes inside the mask round them off so normals don't flip.
+    for _ in range(2):
+        height = {
+            (x, y): sum(height.get((x + dx, y + dy), 0.0)
+                        for dx in (-1, 0, 1) for dy in (-1, 0, 1)) / 9.0
+            for (x, y) in height
+        }
+    lv = _light_vector(light)
+    value = {}
+    for (x, y) in mask:
+        h = height[(x, y)]
+        hl = height.get((x - 1, y), 0.0)
+        hr = height.get((x + 1, y), 0.0)
+        hu = height.get((x, y - 1), 0.0)
+        hd = height.get((x, y + 1), 0.0)
+        gx, gy = (hr - hl) / 2.0, (hd - hu) / 2.0
+        m = math.sqrt(gx * gx + gy * gy + 1.0)
+        value[(x, y)] = _lambert(-gx / m, -gy / m, 1.0 / m, lv) + 0.01 * h / peak
+    return _rank_quantize(img, mask, value, ramp, base_idx)
+
+
+def _edge_distance(mask: set) -> Dict[Tuple[int, int], float]:
+    """Chamfer distance (3-4 weights) from each mask pixel to the outside."""
+    inf = float("inf")
+    d = {p: inf for p in mask}
+    for (x, y) in mask:
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if (nx, ny) not in mask:
+                d[(x, y)] = 1.0
+                break
+    order = sorted(mask, key=lambda p: (p[1], p[0]))
+    fwd = ((-1, 0, 1.0), (0, -1, 1.0), (-1, -1, 1.4), (1, -1, 1.4))
+    bwd = ((1, 0, 1.0), (0, 1, 1.0), (1, 1, 1.4), (-1, 1, 1.4))
+    for seq, nb in ((order, fwd), (order[::-1], bwd)):
+        for (x, y) in seq:
+            best = d[(x, y)]
+            for dx, dy, w in nb:
+                q = d.get((x + dx, y + dy))
+                if q is not None and q + w < best:
+                    best = q + w
+            d[(x, y)] = best
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +625,184 @@ def apply_spaa(
                 interior_n += 1
 
     return edge_n, interior_n
+
+
+# ---------------------------------------------------------------------------
+# Lint: the consistency problems that make pixel art look amateur
+# ---------------------------------------------------------------------------
+
+NEAR_DUPLICATE = 14.0  # redmean distance under which two colors read as one
+STRAY_CONTRAST = 40.0  # an orphan pixel closer than this to its surroundings is noise
+
+
+def color_distance(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> float:
+    """'Redmean' perceptual RGB distance — cheap and good enough for palettes."""
+    rm = (a[0] + b[0]) / 2.0
+    dr, dg, db = a[0] - b[0], a[1] - b[1], a[2] - b[2]
+    return math.sqrt((2 + rm / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rm) / 256) * db * db) / 3.0
+
+
+def _luma(c: Tuple[int, int, int]) -> float:
+    return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+
+
+# Within 2px, plus the 4px lattice where the sparsest Bayer-4 level repeats.
+_PARTNER_OFFSETS = [(dx, dy) for dy in range(-2, 3) for dx in range(-2, 3) if dx or dy] + [
+    (4, 0), (-4, 0), (0, 4), (0, -4), (4, 4), (-4, -4), (4, -4), (-4, 4)]
+
+
+def _has_partner(px, x: int, y: int, w: int, h: int, c) -> bool:
+    """Dither and texture always have a same-colored pixel close by on their
+    pattern; a speck of noise does not."""
+    for dx, dy in _PARTNER_OFFSETS:
+        if 0 <= x + dx < w and 0 <= y + dy < h:
+            q = px[x + dx, y + dy]
+            if q[3] and q[:3] == c[:3]:
+                return True
+    return False
+
+
+def lint(img: PILImage.Image, max_colors: int = 16, fix: bool = False) -> Dict[str, object]:
+    """Find (and optionally fix) what makes a piece look inconsistent.
+
+    * near-duplicate colors — two colors no viewer can tell apart split one
+      material into noise and waste the palette; fix merges the rarer into the
+      commoner.
+    * stray pixels — a pixel with no same-colored pixel within 2px that
+      barely contrasts with its surroundings: noise, not detail. High-contrast
+      lone pixels (eyes, sparkles, glints) are deliberate and left alone;
+      dither and texture always have a partner within 2px and are left alone
+      too. Fix paints them with the
+      surrounding color.
+    * color budget, partial alpha, and outline coverage are reported.
+    """
+    w, h = img.size
+    px = img.load()
+    counts: Dict[Tuple[int, int, int], int] = {}
+    partial = 0
+    for y in range(h):
+        for x in range(w):
+            c = px[x, y]
+            if c[3] == 0:
+                continue
+            if c[3] < 255:
+                partial += 1
+            counts[c[:3]] = counts.get(c[:3], 0) + 1
+
+    issues: List[str] = []
+    fixed = {"merged_colors": 0, "strays_cleaned": 0}
+
+    colors = sorted(counts, key=lambda c: -counts[c])
+    dupes = []
+    merge: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+    for i, a in enumerate(colors):
+        for b in colors[i + 1:]:
+            if b in merge or a in merge:
+                continue
+            d = color_distance(a, b)
+            if d < NEAR_DUPLICATE:
+                dupes.append((a, b, d))
+                merge[b] = a  # b is rarer (colors sorted by count)
+    if dupes:
+        issues.append(
+            f"{len(dupes)} near-duplicate color pair(s) — merge them so each material "
+            "reads as one ramp: " + ", ".join(
+                f"{color_hex(b + (255,))}({counts[b]}px)->{color_hex(a + (255,))}"
+                for a, b, _ in dupes[:8])
+        )
+        if fix:
+            for y in range(h):
+                for x in range(w):
+                    c = px[x, y]
+                    if c[3] and c[:3] in merge:
+                        px[x, y] = merge[c[:3]] + (c[3],)
+            fixed["merged_colors"] = len(merge)
+
+    strays = []
+    snap = img.copy().load() if fix else px
+    for y in range(h):
+        for x in range(w):
+            c = snap[x, y]
+            if c[3] == 0:
+                continue
+            nbs = [snap[x + dx, y + dy] for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                   if (dx or dy) and 0 <= x + dx < w and 0 <= y + dy < h]
+            if len(nbs) < 8:
+                continue
+            opaque = [n[:3] for n in nbs if n[3]]
+            if len(opaque) < 6:
+                continue  # an edge pixel; the silhouette is the outline's business
+            if _has_partner(snap, x, y, w, h, c):
+                continue
+            major = max(set(opaque), key=opaque.count)
+            if opaque.count(major) >= 5 and color_distance(c[:3], major) < STRAY_CONTRAST:
+                strays.append((x, y, major))
+    if strays:
+        issues.append(
+            f"{len(strays)} stray pixel(s) — lone, low-contrast specks that read as "
+            "noise, e.g. at " + ", ".join(f"({x},{y})" for x, y, _ in strays[:10])
+        )
+        if fix:
+            for x, y, major in strays:
+                px[x, y] = major + (px[x, y][3],)
+            fixed["strays_cleaned"] = len(strays)
+
+    n_colors = len({px[x, y][:3] for y in range(h) for x in range(w) if px[x, y][3]})
+    if n_colors > max_colors:
+        issues.append(
+            f"{n_colors} colors, over the {max_colors} budget — snap with "
+            "pixel_apply_palette or merge ramps."
+        )
+    if partial:
+        issues.append(
+            f"{partial} semi-transparent pixel(s). Fine if they are SPAA edge softening; "
+            "anywhere else they blend unpredictably over backgrounds."
+        )
+
+    # Outline coverage: how much of the silhouette edge is darker than the
+    # pixel just inside it. Near 0 = no outline, near 1 = full; in between is a
+    # half-finished outline, the most common inconsistency.
+    edge = dark = 0
+    for y in range(h):
+        for x in range(w):
+            c = px[x, y]
+            if c[3] == 0:
+                continue
+            outward = [(dx, dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                       if not (0 <= x + dx < w and 0 <= y + dy < h) or px[x + dx, y + dy][3] == 0]
+            if not outward:
+                continue
+            dx, dy = outward[0]
+            ix, iy = x - dx, y - dy
+            if not (0 <= ix < w and 0 <= iy < h) or px[ix, iy][3] == 0:
+                continue
+            edge += 1
+            if _luma(c[:3]) < _luma(px[ix, iy][:3]) - 8:
+                dark += 1
+    coverage = round(dark / edge, 2) if edge else None
+    if coverage is not None and edge >= 24 and 0.35 <= coverage <= 0.8:
+        issues.append(
+            f"outline covers {int(coverage * 100)}% of the silhouette — commit: run "
+            "pixel_outline_sprite for a full outline, or leave none."
+        )
+
+    score = 100
+    score -= min(30, 3 * len(dupes))
+    score -= min(30, 2 * len(strays))
+    score -= min(20, 2 * max(0, n_colors - max_colors))
+    if coverage is not None and edge >= 24 and 0.35 <= coverage <= 0.8:
+        score -= 10
+    report: Dict[str, object] = {
+        "score": max(0, score),
+        "colors": n_colors,
+        "near_duplicates": len(dupes),
+        "strays": len(strays),
+        "outline_coverage": coverage,
+        "issues": issues or ["none — palette is tight and edges are clean"],
+    }
+    if fix:
+        report["fixed"] = fixed
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -623,7 +972,8 @@ STAGE 3 — FLAT COLORS.
 
 STAGE 4 — SHADING.
   One pixel_shade_region call per material (same light every call!):
-  sphere = round things, cylinder = limbs/bottles/trunks, bevel = everything else.
+  form = organic shapes (bodies, foliage, clouds, cloth), sphere = round things,
+  cylinder = limbs/bottles/trunks, bevel = flat-faced things (armor, crates).
   Large smooth areas (sky, glow): pixel_draw_gradient with dither='bayer4'.
   GATE: light reads from ONE direction; base color still covers ~60%.
 
@@ -634,10 +984,12 @@ STAGE 5 — DETAILS.
 
 STAGE 6 — FINISH.
   pixel_outline_sprite (mode='selective' for soft look, 'solid' #1a1c2c-style
-  for game sprites). Then pixel_apply_spaa LAST — it softens diagonal
-  staircases and is what makes edges read as drawn rather than blocky (leave
-  interior=false under ~32px). pixel_canvas_info: too many stray colors ->
-  pixel_apply_palette with your ramps. Final pixel_view_canvas at high scale.
+  for game sprites). Then pixel_apply_spaa — it softens diagonal staircases
+  and is what makes edges read as drawn rather than blocky (leave
+  interior=false under ~32px). Then pixel_lint fix=true: it merges colors
+  nobody can tell apart and cleans stray specks. Aim for score >= 90; if it
+  reports colors over budget, pixel_apply_palette with your ramps. Final
+  pixel_view_canvas at high scale.
 
 TOKEN DISCIPLINE — two rules, both worth more than they look.
   1. BATCH EACH STAGE. Send a whole stage as ONE pixel_batch call rather than
@@ -697,10 +1049,14 @@ Rules of thumb:
   If shading covers most of a region, undo — you have pillow-shading.
 
   WHICH MODE (pixel_shade_region):
-    sphere    fruit, heads, orbs, clouds, muscle masses
+    form      ANY organic silhouette — creature bodies, foliage clumps, clouds,
+              cloth, rocks. Each lobe rounds on its own; the default choice.
+    sphere    fruit, heads, orbs — one round mass
     cylinder  limbs, bottles, trunks, towers, barrels(on side)
-    bevel     armor plates, rocks, cloth folds, UI, anything angular
-  Ramp is auto-built from the region color; pass your own for a custom look.
+    bevel     flat-faced things: armor plates, crates, stone blocks, UI
+  form/sphere/cylinder keep the 60/25/15 proportions for you, so every object
+  in a piece shades in the same style. Ramp is auto-built from the region
+  color (which stays the base); pass your own for a custom look.
 
   BY HAND ON TOP (pixel_paint_grid / pixel_draw_pixels):
     - Ambient occlusion: darkest step where things touch (under chin, arm
@@ -797,60 +1153,68 @@ Rules of thumb:
      instantly, darken the background or brighten the subject's rim.""",
 
     "animation": """ANIMATION — do NOT draw frame by frame. Draw ONE sprite, rig it,
-and let the server stamp the frames. An 8-frame walk should cost one drawing.
+and let the server pose the frames. An 8-frame walk should cost one drawing.
 
 THE LOOP:
-  1. Draw the character once, side-on, in a neutral pose. Finish it properly
-     (pixel_guide topic='workflow') — every frame is made of these exact
-     pixels, so flaws repeat 8 times.
+  1. Draw the character once, side-on, facing RIGHT, in a neutral pose with
+     arms and legs hanging straight. Finish it properly (topic='workflow') —
+     every frame is made of these exact pixels, so flaws repeat 8 times.
   2. DRAW THE LIMBS IN A PARTS BIN, not on the body. Make the canvas wider
-     than the sprite and draw arm_back/arm_front/leg_back/leg_front out to the
-     side, each clear of the others. Keep head and torso where they belong.
-     Why: a part is a RECTANGLE of source pixels, so two limbs drawn on top of
+     than the sprite and draw each limb segment out to the side, clear of the
+     others: upper arm, forearm (+hand), thigh, shin (+foot), for the back
+     and front side. Keep head and torso where they belong.
+     Why: a part is a RECTANGLE of source pixels, so limbs drawn on top of
      each other can never be boxed apart — but a side view needs them to
-     overlap once placed. Drawing them apart and placing them together is the
-     only way to get both.
-  3. pixel_define_rig — box each part, and give the binned limbs at_x/at_y for
-     where they land on the body. Set frame_width/frame_height to the sprite,
-     so the bin never shows up in a frame. Name parts head, torso, arm_back,
-     arm_front, leg_back, leg_front and the built-in motions need no wiring.
-  4. Check the preview. Magenta = drawn pixels no box covers; they vanish from
-     every frame. Fix before rendering, not after.
-  5. pixel_render_motion motion='walk' -> frames. pixel_motions lists the rest.
+     overlap once placed.
+  3. pixel_define_rig. Name parts head, torso, arm_back, arm_front, leg_back,
+     leg_front (the upper segments, given at_x/at_y on the body) and
+     forearm_back, forearm_front, shin_back, shin_front with
+     parent=<the upper segment> and NO at_x/at_y — their joint snaps onto
+     the parent's bottom row. Set frame_width/frame_height to the sprite so
+     the bin never shows. Single-segment limbs work too: skip the lower parts.
+  4. Check the preview. Magenta = drawn pixels no box covers (they vanish).
+     Dots = joints: each must sit on the hip/shoulder/knee/elbow.
+  5. pixel_render_motion motion='walk' (or 'run') -> frames.
   6. pixel_export_gif on the returned frame_paths. 100-125ms per frame reads
      as walking; 60-80ms as running.
 
-RIGGING RULES that decide whether it looks right:
+HOW LIMBS MOVE:
+  - Parts SWING about their pivot with the 'angle' channel (degrees; positive
+    swings a hanging limb's end toward +x, i.e. forward). The pivot defaults
+    to the top-center of the box — where a limb hangs from.
+  - Children ride their parent: rotate the thigh and the shin goes with it,
+    then bends at the knee by its own angle. That is what makes a stride
+    flow instead of sliding blocks.
+  - Rotation is RotSprite: the part is upscaled 8x with Scale2x and sampled
+    back at the new angle, so it only ever reuses your drawn colors and edges
+    stay clean. Thin (1px) features can still nick at odd angles — draw limbs
+    at least 3px wide.
+  - GROUND LOCK (on for walk/run): every frame is shifted so the lowest pixel
+    sits on the rest pose's floor. Planted feet never sink or float, and the
+    body's up-and-down bob falls out of the leg angles for free.
+
+RIGGING RULES:
   - Z-ORDER: back limbs lowest, then torso, then front limbs, head highest.
-    Shade the back limbs one ramp step darker — depth reads from value, and it
-    is what stops overlapping legs from looking like one blob.
-  - OVERLAP THE JOINTS. The torso box must run OVER the hips and shoulders by
-    2-3px. A limb swinging away from a flush-cut torso tears a visible hole;
-    an overlapping torso covers the gap for free.
-  - ANCHOR 'bottom' for legs and body (feet stay planted under squash),
-    'center' for heads and floating props.
-  - Placed boxes may overlap freely — they composite in z-order. Gaps in the
-    frame are the enemy, not overlaps.
-  - A part with no at_x/at_y renders where it was drawn. That is right for the
-    head and torso, and for simple props that only bob or float.
+    Shade the back limbs one ramp step darker — depth reads from value.
+  - OVERLAP THE JOINTS. The torso box should run 2-3px over the hips and
+    shoulders, so a swinging limb never opens a hole at its root.
+  - ANCHOR 'bottom' for legs and body, 'center' for heads and floating props.
 
 MOTION RULES:
-  - NO ARBITRARY ROTATION. Pixel art does not survive it. You get flip (mirror)
-    and rot (90/180/270) only. For an in-between limb angle, draw that angle as
-    its own part and switch to it with the 'use' channel — part-swapping is how
-    real sprite work handles rotation.
   - Keys are [t, value] with t in [0, 1). The cycle wraps on its own; a key at
     t=1 is an error, not a closing frame.
-  - Offsets round to whole pixels. Amplitudes under ~2px on a 32px sprite will
-    quantize away — go bigger or use fewer frames.
+  - dx/dy/squash round to whole pixels; amplitudes under ~2px on a 32px
+    sprite quantize away. Angles do not round.
   - CONTRAST BEATS SMOOTHNESS. 8 punchy frames read better than 24 soft ones.
-    Hard cuts are the pixel-art aesthetic, not a defect to interpolate out.
-  - Opposition sells weight: arms swing against legs, body dips twice per
-    stride (lowest at contact, highest at the passing pose).
+  - Opposition sells weight: arms swing against legs.
+  - Start from a preset (pixel_motions) and override one part with `custom`
+    rather than authoring a cycle from scratch.
+  - flip/rot (90-degree steps) and the 'use' part-swap still exist for poses
+    no rotation can reach — a hand opening, a face turning.
 
 MOVING A WHOLE SCENE: rig the scrolling layers as parts and drive them with
-'*' or per-layer dx at different rates — parallax for free. For a background
-that repeats, pixel_shift_canvas with wrap=true is cheaper than a rig.""",
+'*' or per-layer dx at different rates — parallax for free (ground_lock off).
+For a background that repeats, pixel_shift_canvas with wrap=true is cheaper.""",
 }
 
 GUIDE_TOPICS = list(GUIDES.keys())

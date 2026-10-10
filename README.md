@@ -11,9 +11,10 @@ symmetry mirroring, text-grid drawing and reading, curated palettes, and an
 on-demand technique guide (`pixel_guide`) with a staged workflow
 (size → palette → silhouette → flats → shading → details → finish).
 
-Sprites animate the same way: rig one drawing into named parts and the server
-generates the whole cycle from it, so an 8-frame walk costs one drawing rather
-than eight.
+Sprites animate the same way: rig one drawing into jointed parts and the server
+generates the whole cycle from it — limbs swing from the hip and shoulder, knees
+and elbows fold, feet stay planted — so an 8-frame walk costs one drawing
+rather than eight.
 
 ## Tools
 
@@ -23,7 +24,7 @@ than eight.
 |---|---|
 | `pixel_guide` | Technique playbook: workflow, sizing, color, shading, dithering, materials, characters, scenes, animation |
 | `pixel_build_ramp` | One base color → professional dark→light ramp (hue-shifted shadows/highlights) |
-| `pixel_shade_region` | Flat regions → shaded 3D form in one call: `sphere`, `cylinder_upright`, `cylinder_side`, `bevel` |
+| `pixel_shade_region` | Flat regions → shaded 3D form in one call: `form` (any organic silhouette), `sphere`, `cylinder_upright`, `cylinder_side`, `bevel` |
 | `pixel_draw_gradient` | Linear/radial gradients with ordered dithering (`bayer4`, `checker`); can target one flat color or fade out via `transparent` |
 | `pixel_paint_grid` | Draw from a text grid + character→color legend — the reliable way to place shapes |
 | `pixel_ascii_view` | Read the canvas back as a labeled character grid with exact coordinates |
@@ -33,6 +34,7 @@ than eight.
 | `pixel_draw_curve` | Quadratic/cubic Bézier strokes for organic contours (necks, tails, hair, flames) |
 | `pixel_apply_spaa` | Sub-pixel anti-aliasing: softens diagonal staircases; uses partial alpha on transparent backgrounds |
 | `pixel_batch` | Run many drawing operations on one canvas in a single call — the default way to draw |
+| `pixel_lint` | Score a piece for consistency (near-duplicate colors, stray specks, color budget, half-finished outline) and fix the safe ones |
 
 ### Drawing
 
@@ -60,7 +62,7 @@ than eight.
 
 | Tool | Purpose |
 |---|---|
-| `pixel_define_rig` | Name the movable parts of a drawn sprite, with a labelled preview that flags art no part covers |
+| `pixel_define_rig` | Name the jointed parts of a drawn sprite, with a labelled preview showing joints and flagging art no part covers |
 | `pixel_render_motion` | Generate a whole animation loop from one rigged sprite |
 | `pixel_motions` | Built-in cycles: `walk`, `run`, `idle`, `bob`, `squash_land` |
 | `pixel_duplicate_canvas` | Start the next frame from the current one |
@@ -79,9 +81,19 @@ the server composite the cycle:
 pixel_define_rig  →  pixel_render_motion motion='walk'  →  pixel_export_gif
 ```
 
-Every frame is stamped from the source pixels at new offsets, and offsets round
-to whole pixels — so nothing is resampled, nothing flickers, and re-rendering
-the same rig is byte-identical. Consistency is arithmetic, not luck.
+Limbs **swing, they don't slide**. Every part has a pivot (its joint, by
+default the top-center of its box) and may name a `parent`: a shin hangs from
+its thigh, a forearm from its upper arm, so rotating the thigh carries the shin
+and the knee then folds by its own angle — forward kinematics. Leave a child's
+`at_x`/`at_y` unset and its joint snaps onto the parent's bottom row.
+
+Rotation is [RotSprite](https://en.wikipedia.org/wiki/Pixel-art_scaling_algorithms#RotSprite):
+the part is upscaled 8× with Scale2x and sampled back down at the new angle, so
+a rotated limb only ever reuses the drawn palette and keeps a clean edge. Walk
+and run use **ground lock**: each frame is shifted so its lowest pixel sits on
+the rest pose's floor, so planted feet never sink or float and the body bob
+falls out of the leg angles instead of being keyed by hand. Offsets round to
+whole pixels and the same rig always renders byte-identical frames.
 
 Draw the limbs in a **parts bin** beside the sprite rather than on the body. A
 part is a rectangle of source pixels, so limbs drawn on top of each other can
@@ -89,22 +101,20 @@ never be boxed apart — but a true side view needs them to overlap once placed.
 `at_x`/`at_y` place a binned part on the body; `frame_width`/`frame_height`
 keep the bin out of the rendered frames. See
 [`benchmarks/examples/demo_walk.py`](benchmarks/examples/demo_walk.py) for a
-complete 8-frame walk from a single 48×48 sheet, and
-[`demo_dusk.py`](benchmarks/examples/demo_dusk.py) for a full 128×96 scene —
+complete 8-frame walk with jointed knees and elbows from a single 48×48 sheet,
+and [`demo_dusk.py`](benchmarks/examples/demo_dusk.py) for a full 128×96 scene —
 parallax, a walking figure, a guttering lantern, flapping birds, a tumbling
 leaf and twinkling stars, all 24 frames of it composited from one 224×200
-sheet, driving every motion channel.
+sheet.
 
 Loops close seamlessly under two rules: layers that tile scroll **exactly one
 tile period** per loop, and sprites that don't tile **start and end
 off-frame**, so the wrap lands where nobody can see it.
 
-**No arbitrary rotation.** Pixel art does not survive being rotated by
-anything but a multiple of 90°, so the orientation channels are `flip` and
-`rot` only. For an in-between limb angle, draw that angle as its own part and
-switch to it with the `use` channel — which is how real sprite work has always
-handled it. Motion channels: `dx`, `dy`, `squash` (interpolated), `flip`,
-`rot`, `visible`, `use` (held). Read `pixel_guide topic='animation'` first.
+Motion channels: `angle` (degrees about the pivot; positive swings a hanging
+limb forward, toward +x), `dx`, `dy`, `squash` (interpolated), `flip`, `rot`
+(90° steps), `visible`, `use` (held — swap in a separately drawn pose). Read
+`pixel_guide topic='animation'` first.
 
 ### Inspection & export
 
@@ -161,6 +171,16 @@ must-haves and a 7-dimension rubric — run them across models or server version
 to measure whether a tooling change actually improves the art.
 `benchmarks/examples/` holds reference pieces drawn with the craft toolset, and
 `benchmarks/runs/` holds completed runs with the script for every piece.
+
+Two scripts make the comparison mechanical:
+
+- `bench_stills.py ROOT...` re-renders every scripted piece for each checkout
+  (in a scratch copy) and lints them all with one ruler, side by side;
+  `--out DIR` adds a visual comparison sheet.
+- `bench_motion.py SHEET FRAME_W [SOURCE]` checks an animation: torn joints,
+  palette leaks, floor jitter, and how evenly the motion flows frame to frame.
+
+Unit tests: `uv run python -m unittest`.
 
 ## Setup
 

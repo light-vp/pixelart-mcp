@@ -1,22 +1,22 @@
 """Rig and motion layer: turn one drawn sprite into an animation.
 
 A rig names rectangular parts of a source canvas; a motion describes how those
-parts translate, mirror, and squash over a normalized cycle t in [0, 1). Frames
-are composited from the source pixels, so every frame is made of art that was
-actually drawn — nothing interpolates pixel *content*, only placement, and
-placements round to whole pixels. That is what keeps a generated frame looking
-hand-made instead of resampled.
+parts move over a normalized cycle t in [0, 1). Frames are composited from the
+source pixels, so every frame is made of art that was actually drawn — only
+placement and orientation are computed, never new colors.
 
-Deliberately absent: arbitrary rotation. Rotating pixel art by anything other
-than a multiple of 90 degrees resamples it into mush, so the only orientation
-channels are `flip` (mirror) and `rot` (90-degree steps). Where a limb really
-needs an in-between angle, draw that angle as its own part and swap to it with
-the `use` channel.
+Limbs swing rather than slide. Each part has a pivot (its joint) and may have a
+parent, so a shin hangs from its thigh and a hand from its forearm: rotating
+the thigh carries the shin with it (forward kinematics). Rotation uses
+RotSprite — the source is upscaled 8x with Scale2x, which keeps edges sharp,
+then sampled back down at the new angle — so a rotated limb is still made of
+the drawn palette and keeps a clean silhouette instead of resampled mush.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,7 +25,8 @@ from PIL import ImageDraw, ImageFont
 
 MAX_PARTS = 32
 
-NUMERIC_CHANNELS = ("dx", "dy", "squash")
+NUMERIC_CHANNELS = ("dx", "dy", "squash", "angle")
+PIXEL_CHANNELS = ("dx", "dy", "squash")  # rounded to whole pixels; angle stays fractional
 STEP_CHANNELS = ("flip", "rot", "visible", "use")
 CHANNELS = NUMERIC_CHANNELS + STEP_CHANNELS
 EASINGS = ("linear", "ease", "step")
@@ -33,13 +34,17 @@ ANCHORS = ("bottom", "center", "top")
 VALID_ROT = (0, 90, 180, 270)
 
 # Part names the built-in motions drive. A rig may use any names it likes, but
-# matching these means the presets work with no extra wiring.
+# matching these means the presets work with no extra wiring. The lower
+# segments (shin/forearm) are optional: give them parent=leg_*/arm_* and the
+# presets bend the knees and elbows too.
 CONVENTIONAL_PARTS = (
     "head", "torso", "arm_back", "arm_front", "leg_back", "leg_front",
+    "shin_back", "shin_front", "forearm_back", "forearm_front",
 )
+OPTIONAL_PARTS = ("shin_back", "shin_front", "forearm_back", "forearm_front")
 
 _DEFAULTS: Dict[str, Any] = {
-    "dx": 0, "dy": 0, "squash": 0,
+    "dx": 0, "dy": 0, "squash": 0, "angle": 0.0,
     "flip": False, "rot": 0, "visible": True, "use": None,
 }
 
@@ -106,21 +111,82 @@ def normalize_rig(data: Any, *, source_size: Optional[Tuple[int, int]] = None) -
         # piece needs no at_* at all. Setting them lets parts be drawn apart
         # from each other — the only way two limbs can overlap in the frame.
         try:
-            at_x = int(p["at_x"]) if p.get("at_x") is not None else x
-            at_y = int(p["at_y"]) if p.get("at_y") is not None else y
+            at_x = int(p["at_x"]) if p.get("at_x") is not None else None
+            at_y = int(p["at_y"]) if p.get("at_y") is not None else None
         except (TypeError, ValueError):
             raise ValueError(f"Part '{name}' has non-integer at_x/at_y.") from None
-        parts.append({
+        # The pivot is the joint the part rotates about, in box-local pixels.
+        # Top-center is where a limb hangs from, which is the common case.
+        try:
+            pivot_x = int(p["pivot_x"]) if p.get("pivot_x") is not None else w // 2
+            pivot_y = int(p["pivot_y"]) if p.get("pivot_y") is not None else 0
+        except (TypeError, ValueError):
+            raise ValueError(f"Part '{name}' has non-integer pivot_x/pivot_y.") from None
+        if not (0 <= pivot_x < w and 0 <= pivot_y < h):
+            raise ValueError(
+                f"Part '{name}' pivot ({pivot_x},{pivot_y}) is outside its {w}x{h} box; "
+                "pivots are box-local, (0,0) is the box's top-left pixel."
+            )
+        parent = p.get("parent")
+        parent = str(parent).strip() if parent else None
+        entry = {
             "name": name, "x": x, "y": y, "width": w, "height": h,
             "at_x": at_x, "at_y": at_y,
             "z": int(p.get("z", i)), "anchor": anchor,
-        })
+            "pivot_x": pivot_x, "pivot_y": pivot_y,
+        }
+        if parent:
+            entry["parent"] = parent
+        parts.append(entry)
+
+    names = {p["name"] for p in parts}
+    for p in parts:
+        if "parent" in p and p["parent"] not in names:
+            raise ValueError(
+                f"Part '{p['name']}' has parent '{p['parent']}', which is not a part. "
+                f"Parts: {', '.join(sorted(names))}."
+            )
+    # Parents first, so an unplaced child can snap to its parent's placement.
+    by_name = {p["name"]: p for p in parts}
+    for p in _parent_order(parts):  # also raises on cycles
+        parent = by_name.get(p.get("parent", ""))
+        if parent is not None and p["at_x"] is None and p["at_y"] is None:
+            # Joint snapping: the child's pivot lands on the parent's bottom
+            # row under the parent's pivot — knee under hip, hand under elbow.
+            p["at_x"] = parent["at_x"] + parent["pivot_x"] - p["pivot_x"]
+            p["at_y"] = parent["at_y"] + parent["height"] - 1 - p["pivot_y"]
+        else:
+            p["at_x"] = p["x"] if p["at_x"] is None else p["at_x"]
+            p["at_y"] = p["y"] if p["at_y"] is None else p["at_y"]
 
     out: Dict[str, Any] = {"parts": parts}
     for key in ("source", "width", "height", "frame_width", "frame_height", "notes"):
         if key in data and data[key] is not None:
             out[key] = data[key]
     return out
+
+
+def _parent_order(parts: List[dict]) -> List[dict]:
+    """Parents before children, so a child's joint can follow its parent."""
+    by_name = {p["name"]: p for p in parts}
+    order: List[dict] = []
+    state: Dict[str, int] = {}  # 1 = visiting, 2 = done
+
+    def visit(p: dict, chain: List[str]) -> None:
+        st = state.get(p["name"])
+        if st == 2:
+            return
+        if st == 1:
+            raise ValueError(f"Parent loop: {' -> '.join(chain + [p['name']])}.")
+        state[p["name"]] = 1
+        if "parent" in p:
+            visit(by_name[p["parent"]], chain + [p["name"]])
+        state[p["name"]] = 2
+        order.append(p)
+
+    for p in parts:
+        visit(p, [])
+    return order
 
 
 def frame_size(rig: dict, source: PILImage.Image) -> Tuple[int, int]:
@@ -259,14 +325,148 @@ def evaluate_part(motion_parts: dict, name: str, t: float) -> Dict[str, Any]:
         )
     for channel, cspec in spec.items():
         v = eval_channel(cspec, t, channel, name)
-        if channel in NUMERIC_CHANNELS:
+        if channel in PIXEL_CHANNELS:
             v = int(round(v))  # whole pixels only — this is the whole point
+        elif channel == "angle":
+            v = float(v)
         elif channel in ("flip", "visible"):
             v = bool(v)
         elif channel == "rot":
             v = int(v) % 360
         values[channel] = v
     return values
+
+
+# ---------------------------------------------------------------------------
+# RotSprite: rotate pixel art without inventing colors
+# ---------------------------------------------------------------------------
+
+ROT_UPSCALE = 8  # three Scale2x passes
+
+
+def _scale2x(px: List[List[tuple]], w: int, h: int) -> List[List[tuple]]:
+    """EPX/Scale2x: double the size, rounding diagonal edges instead of
+    blocking them. Only ever copies an existing neighbour, so no new colors."""
+    out = [[None] * (w * 2) for _ in range(h * 2)]
+    for y in range(h):
+        row = px[y]
+        up = px[y - 1] if y > 0 else None
+        dn = px[y + 1] if y + 1 < h else None
+        for x in range(w):
+            p = row[x]
+            a = up[x] if up is not None else p
+            d = dn[x] if dn is not None else p
+            c = row[x - 1] if x > 0 else p
+            b = row[x + 1] if x + 1 < w else p
+            e0 = e1 = e2 = e3 = p
+            if c == a and c != d and a != b:
+                e0 = a
+            if a == b and a != c and b != d:
+                e1 = b
+            if d == c and d != b and c != a:
+                e2 = c
+            if b == d and b != a and d != c:
+                e3 = d
+            out[2 * y][2 * x] = e0
+            out[2 * y][2 * x + 1] = e1
+            out[2 * y + 1][2 * x] = e2
+            out[2 * y + 1][2 * x + 1] = e3
+    return out
+
+
+def _upscale_for_rotation(region: PILImage.Image) -> Tuple[List[List[tuple]], int, int]:
+    """Region padded by one transparent pixel (so the silhouette edge rounds
+    too) and upscaled 8x. Returns (rows, width, height) of the big image."""
+    w, h = region.width + 2, region.height + 2
+    padded = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+    padded.paste(region, (1, 1))
+    getter = getattr(padded, "get_flattened_data", None)  # getdata() is deprecated in Pillow 12
+    data = list(getter() if getter is not None else padded.getdata())
+    rows = [[data[y * w + x] if data[y * w + x][3] else (0, 0, 0, 0) for x in range(w)]
+            for y in range(h)]
+    for _ in range(3):
+        rows = _scale2x(rows, w, h)
+        w, h = w * 2, h * 2
+    return rows, w, h
+
+
+def _rotate_vec(vx: float, vy: float, deg: float) -> Tuple[float, float]:
+    """Rotate a screen-space offset. Positive degrees swing the end of a
+    downward-hanging limb toward +x (forward, for a right-facing sprite)."""
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    return vx * c + vy * s, -vx * s + vy * c
+
+
+def _rotsprite(
+    region: PILImage.Image,
+    pivot: Tuple[float, float],
+    deg: float,
+    world_pivot: Tuple[float, float],
+    cache: Dict[int, Tuple[List[List[tuple]], int, int]],
+) -> Tuple[PILImage.Image, int, int]:
+    """Rotate `region` by `deg` about its local `pivot`, landing that pivot at
+    `world_pivot`. Returns (image, left, top) in frame coordinates."""
+    key = id(region)
+    if key not in cache:
+        cache[key] = _upscale_for_rotation(region)
+    big, bw, bh = cache[key]
+    k = ROT_UPSCALE
+
+    w, h = region.width, region.height
+    corners = [_rotate_vec(cx - pivot[0], cy - pivot[1], deg)
+               for cx in (-1, w + 1) for cy in (-1, h + 1)]
+    left = math.floor(world_pivot[0] + min(c[0] for c in corners))
+    top = math.floor(world_pivot[1] + min(c[1] for c in corners))
+    right = math.ceil(world_pivot[0] + max(c[0] for c in corners))
+    bottom = math.ceil(world_pivot[1] + max(c[1] for c in corners))
+
+    out = PILImage.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0))
+    opx = out.load()
+    for oy in range(out.height):
+        for ox in range(out.width):
+            # Inverse-map this output pixel's center into the big image.
+            vx = left + ox + 0.5 - world_pivot[0]
+            vy = top + oy + 0.5 - world_pivot[1]
+            lx, ly = _rotate_vec(vx, vy, -deg)
+            sx = math.floor((lx + pivot[0] + 1) * k)
+            sy = math.floor((ly + pivot[1] + 1) * k)
+            if 0 <= sx < bw and 0 <= sy < bh:
+                c = big[sy][sx]
+                if c[3]:
+                    opx[ox, oy] = c
+    if _min_thickness_ok(region):
+        _remove_spurs(out)
+    return out, left, top
+
+
+def _opaque_neighbors(px, x: int, y: int, w: int, h: int) -> int:
+    n = 0
+    for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+        if 0 <= nx < w and 0 <= ny < h and px[nx, ny][3]:
+            n += 1
+    return n
+
+
+def _min_thickness_ok(region: PILImage.Image) -> bool:
+    """True when the drawn part has no 1px-wide tips of its own — then any
+    tip in the rotated copy is a sampling spur, not art."""
+    px = region.load()
+    w, h = region.size
+    return not any(
+        px[x, y][3] and _opaque_neighbors(px, x, y, w, h) <= 1
+        for y in range(h) for x in range(w)
+    )
+
+
+def _remove_spurs(img: PILImage.Image) -> None:
+    """Drop lone pixels that rotation sampling leaves hanging off an edge."""
+    px = img.load()
+    w, h = img.size
+    spurs = [(x, y) for y in range(h) for x in range(w)
+             if px[x, y][3] and _opaque_neighbors(px, x, y, w, h) <= 1]
+    for x, y in spurs:
+        px[x, y] = (0, 0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -280,20 +480,86 @@ _ROT_TRANSPOSE = {
 }
 
 
+def _oriented_pivot(px: int, py: int, w: int, h: int, flip: bool, rot: int) -> Tuple[int, int]:
+    """Where a box-local pivot pixel lands after flip and a 90-degree turn."""
+    if flip:
+        px = w - 1 - px
+    if rot == 90:
+        return h - 1 - py, px
+    if rot == 180:
+        return w - 1 - px, h - 1 - py
+    if rot == 270:
+        return py, w - 1 - px
+    return px, py
+
+
+def _orient(source: PILImage.Image, part: dict, src: dict, ch: Dict[str, Any]):
+    """Cut a part's pixels and apply flip / 90-degree turn / squash. Returns
+    (region, pivot) with the joint in region-local coordinates (pixel center)."""
+    region = source.crop((src["x"], src["y"], src["x"] + src["width"], src["y"] + src["height"]))
+    if ch["flip"]:
+        region = region.transpose(PILImage.Transpose.FLIP_LEFT_RIGHT)
+    rot = ch["rot"]
+    if rot:
+        transpose = _ROT_TRANSPOSE.get(rot)
+        if transpose is None:
+            raise ValueError(f"Part '{part['name']}' has rot={rot}; only {VALID_ROT} are allowed.")
+        region = region.transpose(transpose)
+    pvx, pvy = _oriented_pivot(src["pivot_x"], src["pivot_y"], src["width"], src["height"],
+                               ch["flip"], rot)
+    pivot = (pvx + 0.5, pvy + 0.5)
+    if ch["squash"]:
+        # Positive squash compresses vertically and spreads horizontally by
+        # the same count, so volume reads as conserved the way squash-and-
+        # stretch expects. Negative values stretch.
+        nw = max(1, region.width + ch["squash"])
+        nh = max(1, region.height - ch["squash"])
+        pivot = (pivot[0] * nw / region.width, pivot[1] * nh / region.height)
+        region = region.resize((nw, nh), PILImage.Resampling.NEAREST)
+    return region, pivot
+
+
+def _origin(part: dict, region: PILImage.Image, ch: Dict[str, Any]) -> Tuple[int, int]:
+    """Top-left of the region in the frame before any rotation. Placed against
+    the part's own box, not a swapped source's, so a part-swap changes the
+    pixels without teleporting the limb."""
+    box_w, box_h = part["width"], part["height"]
+    px = part["at_x"] + ch["dx"] + (box_w - region.width) // 2
+    if part["anchor"] == "bottom":
+        py = part["at_y"] + ch["dy"] + (box_h - region.height)
+    elif part["anchor"] == "center":
+        py = part["at_y"] + ch["dy"] + (box_h - region.height) // 2
+    else:
+        py = part["at_y"] + ch["dy"]
+    return px, py
+
+
+def _paste_clipped(frame: PILImage.Image, region: PILImage.Image, px: int, py: int) -> None:
+    # Clip rather than fail: a limb may legitimately swing past the edge.
+    left, top = max(0, -px), max(0, -py)
+    right = min(region.width, frame.width - px)
+    bottom = min(region.height, frame.height - py)
+    if left >= right or top >= bottom:
+        return
+    frame.alpha_composite(region.crop((left, top, right, bottom)), (px + left, py + top))
+
+
 def compose_frame(
     source: PILImage.Image,
     rig: dict,
     motion_parts: dict,
     t: float,
+    cache: Optional[dict] = None,
 ) -> PILImage.Image:
-    """Build one frame by stamping each rigged part at its position at time t."""
+    """Build one frame: pose every part (parents first, so children follow
+    their joints), then stamp them in z order."""
     frame = PILImage.new("RGBA", frame_size(rig, source), (0, 0, 0, 0))
     lookup = parts_by_name(rig)
-    for part in sorted(rig["parts"], key=lambda p: p["z"]):
-        ch = evaluate_part(motion_parts, part["name"], t)
-        if not ch["visible"]:
-            continue
+    cache = {} if cache is None else cache
+    posed: Dict[str, dict] = {}
 
+    for part in _parent_order(rig["parts"]):
+        ch = evaluate_part(motion_parts, part["name"], t)
         src = part
         if ch["use"] is not None:
             src = lookup.get(str(ch["use"]))
@@ -302,44 +568,49 @@ def compose_frame(
                     f"Part '{part['name']}' swaps to unknown part '{ch['use']}'. "
                     f"Known parts: {', '.join(sorted(lookup))}."
                 )
-        region = source.crop((src["x"], src["y"], src["x"] + src["width"], src["y"] + src["height"]))
+        key = (src["name"], ch["flip"], ch["rot"], ch["squash"])
+        if key not in cache:
+            cache[key] = _orient(source, part, src, ch)
+        region, pivot = cache[key]
+        origin = _origin(part, region, ch)
 
-        if ch["flip"]:
-            region = region.transpose(PILImage.Transpose.FLIP_LEFT_RIGHT)
-        if ch["rot"]:
-            transpose = _ROT_TRANSPOSE.get(ch["rot"])
-            if transpose is None:
-                raise ValueError(
-                    f"Part '{part['name']}' has rot={ch['rot']}; only {VALID_ROT} are allowed."
-                )
-            region = region.transpose(transpose)
-        if ch["squash"]:
-            # Positive squash compresses vertically and spreads horizontally by
-            # the same count, so volume reads as conserved the way squash-and-
-            # stretch expects. Negative values stretch.
-            nw = max(1, region.width + ch["squash"])
-            nh = max(1, region.height - ch["squash"])
-            region = region.resize((nw, nh), PILImage.Resampling.NEAREST)
+        rest = (origin[0] + pivot[0], origin[1] + pivot[1])
+        angle = ch["angle"]
+        world = rest
+        parent = posed.get(part.get("parent", ""))
+        if parent is not None:
+            # Carry the joint with the parent's rotation and offset, then snap
+            # to a pixel center so the limb lands on the grid, not between it.
+            vx, vy = _rotate_vec(rest[0] - parent["rest"][0], rest[1] - parent["rest"][1],
+                                 parent["angle"])
+            world = (math.floor(parent["world"][0] + vx) + 0.5,
+                     math.floor(parent["world"][1] + vy) + 0.5)
+            angle += parent["angle"]
+        posed[part["name"]] = {
+            "part": part, "ch": ch, "region": region, "pivot": pivot,
+            "rest": rest, "world": world, "angle": angle,
+        }
 
-        # Place against the part's own box, not the swapped source's, so a
-        # part-swap changes the pixels without teleporting the limb.
-        box_w, box_h = part["width"], part["height"]
-        px = part["at_x"] + ch["dx"] + (box_w - region.width) // 2
-        if part["anchor"] == "bottom":
-            py = part["at_y"] + ch["dy"] + (box_h - region.height)
-        elif part["anchor"] == "center":
-            py = part["at_y"] + ch["dy"] + (box_h - region.height) // 2
-        else:
-            py = part["at_y"] + ch["dy"]
-
-        # Clip rather than fail: a limb may legitimately swing past the edge.
-        left, top = max(0, -px), max(0, -py)
-        right = min(region.width, frame.width - px)
-        bottom = min(region.height, frame.height - py)
-        if left >= right or top >= bottom:
+    rot_cache: dict = cache.setdefault("_rotsprite", {})
+    for part in sorted(rig["parts"], key=lambda p: p["z"]):
+        pose = posed[part["name"]]
+        if not pose["ch"]["visible"]:
             continue
-        frame.alpha_composite(region.crop((left, top, right, bottom)), (px + left, py + top))
+        region, angle = pose["region"], pose["angle"]
+        if abs(angle) < 0.5:
+            # No rotation: an exact stamp of the drawn pixels.
+            px = round(pose["world"][0] - pose["pivot"][0])
+            py = round(pose["world"][1] - pose["pivot"][1])
+            _paste_clipped(frame, region, px, py)
+        else:
+            img, left, top = _rotsprite(region, pose["pivot"], angle, pose["world"], rot_cache)
+            _paste_clipped(frame, img, left, top)
     return frame
+
+
+def _lowest_opaque_row(img: PILImage.Image) -> Optional[int]:
+    bbox = img.getchannel("A").point(lambda a: 255 if a > 8 else 0).getbbox()
+    return None if bbox is None else bbox[3]
 
 
 def render_cycle(
@@ -347,9 +618,37 @@ def render_cycle(
     rig: dict,
     motion_parts: dict,
     frames: int,
+    ground: bool = False,
+    lift: Optional[Any] = None,
 ) -> List[PILImage.Image]:
-    """Render a full loop as `frames` images sampled evenly across t in [0, 1)."""
-    return [compose_frame(source, rig, motion_parts, i / frames) for i in range(frames)]
+    """Render a full loop as `frames` images sampled evenly across t in [0, 1).
+
+    With ground=True each frame is shifted so its lowest pixel sits where the
+    rest pose's does — the planted foot stays on the floor and the body bob
+    falls out of the leg angles, instead of being keyed by hand. `lift` keys
+    (pixels, negative = up) then raise the whole frame, e.g. a run's airborne
+    beat.
+    """
+    cache: dict = {}
+    images = [compose_frame(source, rig, motion_parts, i / frames, cache) for i in range(frames)]
+    if not ground and lift is None:
+        return images
+    floor = _lowest_opaque_row(compose_frame(source, rig, {}, 0.0, cache)) if ground else None
+    out = []
+    for i, img in enumerate(images):
+        shift = 0
+        if floor is not None:
+            low = _lowest_opaque_row(img)
+            if low is not None:
+                shift = floor - low
+        if lift is not None:
+            shift += int(round(eval_channel(lift, i / frames, "dy", "lift")))
+        if shift:
+            moved = PILImage.new("RGBA", img.size, (0, 0, 0, 0))
+            _paste_clipped(moved, img, 0, shift)
+            img = moved
+        out.append(img)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +729,15 @@ def rig_preview(source: PILImage.Image, rig: dict, scale: int) -> Tuple[PILImage
         tx, ty = x0 + 1, max(margin, y0 - 9)
         draw.rectangle([tx - 1, ty - 1, tx + 5.4 * len(label) + 1, ty + 8], fill=(16, 16, 20, 215))
         draw.text((tx, ty), label, fill=color + (255,), font=font)
+    # Joints last, so no label hides one: a ringed dot where each part's pivot
+    # lands on the body — it should sit on the hip, shoulder, knee or elbow.
+    for i, p in enumerate(ordered):
+        color = _BOX_COLORS[i % len(_BOX_COLORS)]
+        cx = margin + (p["at_x"] + p["pivot_x"]) * scale + scale // 2
+        cy = margin + (p["at_y"] + p["pivot_y"]) * scale + scale // 2
+        r = max(2, scale // 3)
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color + (255,),
+                     outline=(16, 16, 20, 255), width=1)
     return PILImage.alpha_composite(canvas, overlay), uncovered
 
 
@@ -444,50 +752,42 @@ def rig_preview(source: PILImage.Image, rig: dict, scale: int) -> Tuple[PILImage
 MOTIONS: Dict[str, Dict[str, Any]] = {
     "walk": {
         "frames": 8,
-        "notes": "Side-view walk cycle: contact, down, pass, up, twice per loop. "
-                 "Arms swing opposite the legs; the body dips twice per stride.",
+        "ground": True,
+        "notes": "Side-view walk, facing right. Legs swing from the hip and arms "
+                 "from the shoulder in opposition; with shins/forearms rigged the "
+                 "knee folds through the passing pose. Feet stay planted and the "
+                 "body bob comes from the leg angles (ground lock).",
         "parts": {
-            "leg_front": {
-                "dx": {"keys": [[0.0, 3], [0.25, 0], [0.5, -3], [0.75, 0]], "easing": "linear"},
-                "dy": {"keys": [[0.0, 0], [0.5, 0], [0.75, -2]]},
-            },
-            "leg_back": {
-                "dx": {"keys": [[0.0, -3], [0.25, 0], [0.5, 3], [0.75, 0]], "easing": "linear"},
-                "dy": {"keys": [[0.0, 0], [0.25, -2], [0.5, 0]]},
-            },
-            "arm_front": {
-                "dx": {"keys": [[0.0, -2], [0.25, 0], [0.5, 2], [0.75, 0]], "easing": "linear"},
-            },
-            "arm_back": {
-                "dx": {"keys": [[0.0, 2], [0.25, 0], [0.5, -2], [0.75, 0]], "easing": "linear"},
-            },
-            "torso": {"dy": {"keys": [[0.0, 0], [0.25, -1], [0.5, 0], [0.75, -1]]}},
-            "head": {"dy": {"keys": [[0.0, 0], [0.25, -1], [0.5, 0], [0.75, -1]]}},
+            "leg_front": {"angle": [[0.0, 24], [0.5, -24]]},
+            "leg_back": {"angle": [[0.0, -24], [0.5, 24]]},
+            "shin_front": {"angle": [[0.0, 0], [0.1, -8], [0.3, 0], [0.55, -14],
+                                     [0.7, -45], [0.88, -10]]},
+            "shin_back": {"angle": [[0.05, -14], [0.2, -45], [0.38, -10], [0.5, 0],
+                                    [0.6, -8], [0.8, 0]]},
+            "arm_front": {"angle": [[0.0, -20], [0.5, 20]]},
+            "arm_back": {"angle": [[0.0, 20], [0.5, -20]]},
+            "forearm_front": {"angle": [[0.0, 6], [0.5, 30]]},
+            "forearm_back": {"angle": [[0.0, 30], [0.5, 6]]},
         },
     },
     "run": {
         "frames": 8,
-        "notes": "Wider stride and a real airborne lift. Legs reach further than walk "
-                 "and the torso rises off the ground between contacts.",
+        "ground": True,
+        "lift": [[0.0, 0], [0.25, -3], [0.5, 0], [0.75, -3]],
+        "notes": "Long stride with an airborne beat between contacts. Legs swing "
+                 "wider than walk, knees fold hard on the recovery, arms pump "
+                 "bent at the elbow.",
         "parts": {
-            "leg_front": {
-                "dx": {"keys": [[0.0, 5], [0.25, 0], [0.5, -5], [0.75, 0]], "easing": "linear"},
-                "dy": {"keys": [[0.0, 0], [0.5, 0], [0.75, -4]]},
-            },
-            "leg_back": {
-                "dx": {"keys": [[0.0, -5], [0.25, 0], [0.5, 5], [0.75, 0]], "easing": "linear"},
-                "dy": {"keys": [[0.0, 0], [0.25, -4], [0.5, 0]]},
-            },
-            "arm_front": {
-                "dx": {"keys": [[0.0, -4], [0.25, 0], [0.5, 4], [0.75, 0]], "easing": "linear"},
-                "dy": {"keys": [[0.0, -1], [0.5, 0]]},
-            },
-            "arm_back": {
-                "dx": {"keys": [[0.0, 4], [0.25, 0], [0.5, -4], [0.75, 0]], "easing": "linear"},
-                "dy": {"keys": [[0.0, 0], [0.5, -1]]},
-            },
-            "torso": {"dy": {"keys": [[0.0, 0], [0.125, -2], [0.5, 0], [0.625, -2]]}},
-            "head": {"dy": {"keys": [[0.0, 0], [0.125, -2], [0.5, 0], [0.625, -2]]}},
+            "leg_front": {"angle": [[0.0, 38], [0.5, -34]]},
+            "leg_back": {"angle": [[0.0, -34], [0.5, 38]]},
+            "shin_front": {"angle": [[0.0, -6], [0.25, -10], [0.5, -30], [0.68, -90],
+                                     [0.88, -20]]},
+            "shin_back": {"angle": [[0.0, -30], [0.18, -90], [0.38, -20], [0.5, -6],
+                                    [0.75, -10]]},
+            "arm_front": {"angle": [[0.0, -40], [0.5, 40]]},
+            "arm_back": {"angle": [[0.0, 40], [0.5, -40]]},
+            "forearm_front": {"angle": [[0.0, 70], [0.5, 90]]},
+            "forearm_back": {"angle": [[0.0, 90], [0.5, 70]]},
         },
     },
     "idle": {
@@ -525,34 +825,47 @@ MOTIONS: Dict[str, Dict[str, Any]] = {
 MOTION_NAMES = list(MOTIONS)
 
 
-def resolve_motion(
-    name: Optional[str],
-    custom: Optional[dict],
-) -> Tuple[dict, Optional[int], str]:
+def resolve_motion(name: Optional[str], custom: Optional[dict]) -> dict:
     """Merge a preset with any inline overrides.
 
-    Returns (parts, suggested_frames, label). Overrides replace a preset entry
-    per part, so tweaking one limb does not mean restating the whole cycle.
+    Returns {"parts", "frames", "label", "ground", "lift"}. Overrides replace a
+    preset entry per part, so tweaking one limb does not mean restating the
+    whole cycle. `custom` is either {part: channels} or a full motion object
+    {"parts": {...}, "ground": bool, "lift": keys} as pixel_motions returns it.
     """
     if name is None and not custom:
         raise ValueError(
             f"Give a motion preset ({', '.join(MOTION_NAMES)}) or a custom parts object."
         )
-    parts: dict = {}
-    frames: Optional[int] = None
-    label = "custom"
+    out: Dict[str, Any] = {"parts": {}, "frames": None, "label": "custom",
+                           "ground": False, "lift": None}
     if name is not None:
         preset = MOTIONS.get(name.lower())
         if preset is None:
             raise ValueError(
                 f"Unknown motion '{name}'. Available: {', '.join(MOTION_NAMES)}."
             )
-        parts = {k: dict(v) for k, v in preset["parts"].items()}
-        frames = int(preset["frames"])
-        label = name.lower()
+        out.update(
+            parts={k: dict(v) for k, v in preset["parts"].items()},
+            frames=int(preset["frames"]), label=name.lower(),
+            ground=bool(preset.get("ground", False)), lift=preset.get("lift"),
+        )
     if custom:
         if not isinstance(custom, dict):
             raise ValueError("Custom motion must be an object mapping part names to channels.")
-        parts.update(custom)
-        label = f"{label}+custom" if name else "custom"
-    return parts, frames, label
+        if isinstance(custom.get("parts"), dict):
+            if "ground" in custom:
+                out["ground"] = bool(custom["ground"])
+            if "lift" in custom:
+                out["lift"] = custom["lift"]
+            if custom.get("frames") is not None:
+                try:
+                    out["frames"] = int(custom["frames"])
+                except (TypeError, ValueError):
+                    raise ValueError(f"Motion 'frames' must be a number, got {custom['frames']!r}.") from None
+            custom = custom["parts"]
+        out["parts"].update(custom)
+        out["label"] = f"{out['label']}+custom" if name else "custom"
+    if out["lift"] is not None:
+        _channel_keys(out["lift"], "dy", "lift")  # validate early, with a clear message
+    return out
