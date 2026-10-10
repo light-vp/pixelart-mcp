@@ -73,6 +73,12 @@ def _load(path: str) -> tuple[Path, PILImage.Image]:
     return p, img
 
 
+def _pixels(img: PILImage.Image):
+    """Flat pixel sequence. getdata() is deprecated from Pillow 12."""
+    getter = getattr(img, "get_flattened_data", None)
+    return getter() if getter is not None else img.getdata()
+
+
 def _png_bytes(img: PILImage.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -134,6 +140,16 @@ DIFF_FULL_FRACTION = 0.7  # a diff this large is not worth cropping
 DIFF_VIEW_TARGET = 160  # diffs render small on purpose — that is the token saving
 
 
+def _changed_mask(before: PILImage.Image, after: PILImage.Image) -> PILImage.Image:
+    """L mask, nonzero wherever any channel differs. getbbox() on RGBA looks
+    only at alpha, so a color-only edit would otherwise read as no change."""
+    bands = ImageChops.difference(before, after).split()
+    mask = bands[0]
+    for band in bands[1:]:
+        mask = ImageChops.lighter(mask, band)
+    return mask
+
+
 def _diff_view(img: PILImage.Image) -> Optional[tuple[PILImage.Image, str]]:
     """Crop to the region this operation changed, for a cheap preview.
 
@@ -142,13 +158,7 @@ def _diff_view(img: PILImage.Image) -> Optional[tuple[PILImage.Image, str]]:
     before = getattr(img, "_pixelart_before", None)
     if before is None or before.size != img.size:
         return None
-    # getbbox() on RGBA looks only at alpha, so a color-only edit would read as
-    # empty; flatten the per-channel differences into one L mask first.
-    bands = ImageChops.difference(before, img).split()
-    mask = bands[0]
-    for band in bands[1:]:
-        mask = ImageChops.lighter(mask, band)
-    bbox = mask.getbbox()
+    bbox = _changed_mask(before, img).getbbox()
     if bbox is None:
         return img.crop((0, 0, min(8, img.width), min(8, img.height))), "no pixels changed"
     x0 = max(0, bbox[0] - DIFF_PAD)
@@ -685,7 +695,7 @@ async def pixel_replace_color(params: ReplaceColorInput) -> Any:
         p, img = _load(params.path)
         find = _parse_color(params.find)
         replace = _parse_color(params.replace)
-        data = list(img.getdata())
+        data = list(_pixels(img))
         changed = data.count(find)
         if changed == 0:
             return (
@@ -1362,7 +1372,7 @@ async def pixel_apply_palette(params: ApplyPaletteInput) -> Any:
             return min(palette, key=lambda c: (c[0] - rgb[0]) ** 2 + (c[1] - rgb[1]) ** 2 + (c[2] - rgb[2]) ** 2)
 
         mapping: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-        data = list(img.getdata())
+        data = list(_pixels(img))
         out = []
         changed = 0
         for px in data:
@@ -1412,7 +1422,7 @@ async def pixel_outline_sprite(params: OutlineInput) -> Any:
         color = _parse_color(params.color)
         mask = img.getchannel("A").point(lambda a: 255 if a > 0 else 0)
         ring = ImageChops.subtract(_dilate(mask, params.corners), mask)
-        outlined = sum(1 for v in ring.getdata() if v)
+        outlined = sum(1 for v in _pixels(ring) if v)
         if outlined == 0:
             return (
                 "Error: nothing to outline — the canvas is either empty or fully opaque. "
@@ -1421,6 +1431,7 @@ async def pixel_outline_sprite(params: OutlineInput) -> Any:
         if params.mode == OutlineMode.SELECTIVE:
             px = img.load()
             ring_px = ring.load()
+            present = {c[:3] for c in _pixels(img) if c[3]}
             cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
             for y in range(img.height):
                 for x in range(img.width):
@@ -1439,7 +1450,7 @@ async def pixel_outline_sprite(params: OutlineInput) -> Any:
                     src = max(set(neighbors), key=neighbors.count)
                     dark = cache.get(src)
                     if dark is None:
-                        dark = craft.darken_for_outline(src)
+                        dark = craft.outline_color(src, present | set(cache.values()))
                         cache[src] = dark
                     px[x, y] = dark + (255,)
         else:
@@ -1667,6 +1678,7 @@ class DrawGradientInput(CanvasOp):
 
 
 class ShadeMode(str, Enum):
+    FORM = "form"
     BEVEL = "bevel"
     SPHERE = "sphere"
     CYLINDER_UPRIGHT = "cylinder_upright"
@@ -1687,8 +1699,10 @@ class LightDirection(str, Enum):
 class ShadeRegionInput(CanvasOp):
     mode: ShadeMode = Field(
         ...,
-        description="'sphere' round things (fruit, heads); 'cylinder_upright' bottles/trunks/limbs; "
-                    "'cylinder_side' barrels/logs lying down; 'bevel' angular things (armor, rocks, cloth)",
+        description="'form' any organic silhouette (bodies, foliage clumps, clouds, cloth) — "
+                    "rounds every lobe on its own; 'sphere' round things (fruit, heads, orbs); "
+                    "'cylinder_upright' bottles/trunks/limbs; 'cylinder_side' barrels/logs lying "
+                    "down; 'bevel' flat-faced things (armor plates, crates, UI, stone blocks)",
     )
     light: LightDirection = Field(
         default=LightDirection.TOP_LEFT,
@@ -1978,13 +1992,19 @@ async def pixel_draw_gradient(params: DrawGradientInput) -> Any:
 async def pixel_shade_region(params: ShadeRegionInput) -> Any:
     """Turn flat color regions into shaded 3D-looking forms in one call.
 
-    Draw flat colors first, then shade: 'sphere' for round masses (fruit,
-    heads, orbs), 'cylinder_upright' for bottles/trunks/standing limbs,
-    'cylinder_side' for barrels/logs lying down, 'bevel' for angular surfaces
-    (armor plates, rocks, cloth) — bevel lightens bands near the lit edge and
-    darkens near the far edge. A hue-shifted ramp is auto-built from each
-    region's color unless you pass one. Keep `light` identical across all
-    calls for one artwork. Returns JSON {"canvas", "mode", "light",
+    Draw flat colors first, then shade: 'form' for any organic silhouette
+    (creature bodies, foliage clumps, clouds, cloth — each lobe rounds on its
+    own), 'sphere' for round masses (fruit, heads, orbs), 'cylinder_upright'
+    for bottles/trunks/standing limbs, 'cylinder_side' for barrels/logs lying
+    down, 'bevel' for flat-faced things (armor plates, crates, stone blocks) —
+    bevel lightens bands near the lit edge and darkens near the far edge.
+
+    The form modes (form/sphere/cylinder) keep proportions fixed: the base
+    color always covers the largest share, shadows ~30%, highlights a small
+    accent — so every object in a piece is shaded in the same style. A
+    hue-shifted ramp is auto-built from each region's color (which stays the
+    base) unless you pass one. Keep `light` identical across all calls for one
+    artwork. Returns JSON {"canvas", "mode", "light",
     "regions_shaded", "pixels_shaded"}; plus a rendered image when
     preview=true. On failure returns "Error: ...".
     """
@@ -2007,16 +2027,21 @@ async def pixel_shade_region(params: ShadeRegionInput) -> Any:
             )
         total = 0
         for color, mask in groups:
-            ramp, base_idx = craft._resolve_ramp(color, explicit_ramp, params.levels)
+            light = params.light.value
             if params.mode == ShadeMode.BEVEL:
+                ramp, base_idx = craft._resolve_ramp(color, explicit_ramp, params.levels)
                 total += craft.shade_bevel(
-                    img, mask, ramp, base_idx, params.light.value, params.levels, params.band_px
+                    img, mask, ramp, base_idx, light, params.levels, params.band_px
                 )
+                continue
+            ramp, base_idx = craft._resolve_form_ramp(color, explicit_ramp)
+            if params.mode == ShadeMode.FORM:
+                total += craft.shade_form(img, mask, ramp, light, base_idx)
             elif params.mode == ShadeMode.SPHERE:
-                total += craft.shade_sphere(img, mask, ramp, params.light.value)
+                total += craft.shade_sphere(img, mask, ramp, light, base_idx)
             else:
                 total += craft.shade_cylinder(
-                    img, mask, ramp, params.light.value,
+                    img, mask, ramp, light, base_idx=base_idx,
                     upright=params.mode == ShadeMode.CYLINDER_UPRIGHT,
                 )
         img.save(p)
@@ -2355,6 +2380,25 @@ class RigPart(BaseModel):
         description="Which edge stays put when the part squashes or rotates. "
                     "'bottom' keeps feet planted; use 'center' for heads and floating props.",
     )
+    pivot_x: Optional[int] = Field(
+        default=None, ge=0,
+        description="Joint X the part swings about, box-local (0 = box's left pixel). "
+                    "Defaults to the box's center column.",
+    )
+    pivot_y: Optional[int] = Field(
+        default=None, ge=0,
+        description="Joint Y, box-local. Defaults to 0 (top row) — where a limb hangs "
+                    "from: hip, shoulder, knee, elbow. Set it to the bottom row for a "
+                    "head that should nod about the neck.",
+    )
+    parent: Optional[str] = Field(
+        default=None,
+        description="Part this one hangs from. A child's joint follows its parent's "
+                    "swing: give shin_front parent='leg_front' and the shin rides the "
+                    "thigh while bending at the knee. Leave the child's at_x/at_y unset "
+                    "and its pivot snaps onto the parent's bottom row, under the parent's "
+                    "pivot — the usual knee/elbow placement, no coordinates needed.",
+    )
 
 
 class DefineRigInput(BaseModel):
@@ -2403,10 +2447,20 @@ class RenderMotionInput(BaseModel):
         default=None,
         description="Inline motion, as {part_name: {channel: [[t, value], ...]}} with t in "
                     "[0, 1) — the loop closes on its own, so never add a key at t=1. "
-                    "Channels: dx, dy, squash (interpolated, rounded to whole pixels); "
-                    "flip, rot, visible, use (held until the next key). Use '*' as a part "
-                    "name to drive every part not named individually. Merges over `motion` "
-                    "when both are given, so you can tweak one limb of a preset.",
+                    "Channels: angle (degrees about the part's pivot; positive swings a "
+                    "hanging limb's end toward +x), dx, dy, squash (interpolated; offsets "
+                    "round to whole pixels); flip, rot, visible, use (held until the next "
+                    "key). Use '*' as a part name to drive every part not named "
+                    "individually. Merges over `motion` when both are given, so you can "
+                    "tweak one limb of a preset. A full object from pixel_motions "
+                    "({'parts': ..., 'ground': ..., 'lift': ...}) is accepted too.",
+    )
+    ground_lock: Optional[bool] = Field(
+        default=None,
+        description="Keep the lowest pixel of every frame on the rest pose's floor line, "
+                    "so planted feet never sink or float and the body bob falls out of "
+                    "the leg angles. Omit to use the motion's default (on for walk/run). "
+                    "Turn off for scenes and flying things.",
     )
     frames: Optional[int] = Field(
         default=None, ge=2, le=MAX_FRAMES,
@@ -2452,15 +2506,18 @@ async def pixel_define_rig(params: DefineRigInput) -> Any:
     redrawing it.
 
     A rig is a list of boxes over ONE finished sprite — draw the character
-    first, then carve it into head/torso/arms/legs. pixel_render_motion then
-    stamps those boxes at new positions to build every frame, so an 8-frame
-    walk costs one drawing instead of eight.
+    first, then carve it into head/torso/limb segments. Each part swings about
+    its pivot (a joint, default top-center), and a part with a `parent` rides
+    that parent: a shin hangs from its thigh, a forearm from its upper arm.
+    pixel_render_motion then poses those parts to build every frame, so an
+    8-frame walk costs one drawing instead of eight.
 
-    Two things decide whether a rig works, and both show up in the preview:
+    Three things decide whether a rig works, and all show up in the preview:
     parts must together cover every drawn pixel (uncovered art is flagged
-    magenta and silently disappears from rendered frames), and overlapping
-    boxes must be ordered with `z` so a moving limb never tears a hole — give
-    the torso a box that runs over the hips and shoulders.
+    magenta and silently disappears from rendered frames); joints (dots) must
+    sit on the hip/shoulder/knee/elbow; and overlapping boxes must be ordered
+    with `z` so a swinging limb never tears a hole — give the torso a box that
+    runs over the hips and shoulders. Read pixel_guide topic='animation' first.
 
     Returns JSON {"rig", "source", "parts", "uncovered_pixels"}; plus the
     labelled preview image when preview=true. On failure returns "Error: ...".
@@ -2494,6 +2551,7 @@ async def pixel_define_rig(params: DefineRigInput) -> Any:
                 f"{p['name']} {p['width']}x{p['height']} from ({p['x']},{p['y']}) z{p['z']}"
                 + (f" -> ({p['at_x']},{p['at_y']})"
                    if (p["at_x"], p["at_y"]) != (p["x"], p["y"]) else "")
+                + (f" hangs from {p['parent']}" if "parent" in p else "")
                 for p in sorted(normalized["parts"], key=lambda q: q["z"])
             ],
         }
@@ -2527,10 +2585,12 @@ async def pixel_render_motion(params: RenderMotionInput) -> Any:
     """Generate a whole animation loop from one rigged sprite — the fast way
     to animate.
 
-    Each frame is composited from the source pixels at new offsets, so every
-    frame is made of art you actually drew; only placement is computed, and it
-    is rounded to whole pixels. That means no flicker, no resampling mush, and
-    a loop that closes seamlessly.
+    Limbs swing about their joints and children follow their parents, so a
+    stride flows instead of sliding. Every frame is made of art you actually
+    drew: rotation is RotSprite (never a new color), offsets round to whole
+    pixels, and walk/run lock the lowest pixel to the floor so feet stay
+    planted and the body bob comes for free. Deterministic: the same rig
+    renders byte-identical frames, and the loop closes seamlessly.
 
     Typical run: pixel_define_rig, then this with motion='walk', then
     pixel_export_gif on the returned frame_paths. Start from a preset and
@@ -2554,12 +2614,21 @@ async def pixel_render_motion(params: RenderMotionInput) -> Any:
         src_p, src = _load(source)
         rig_data = rig.normalize_rig(rig_data, source_size=src.size)
 
-        motion_parts, preset_frames, label = rig.resolve_motion(params.motion, params.custom)
-        count = params.frames or preset_frames or 8
+        motion = rig.resolve_motion(params.motion, params.custom)
+        motion_parts, label = motion["parts"], motion["label"]
+        count = params.frames or motion["frames"] or 8
+        ground = motion["ground"] if params.ground_lock is None else params.ground_lock
 
-        driven = {n for n in motion_parts if n != "*"}
+        # Presets drive optional parts (shins, forearms) a simple rig lacks, so
+        # only flag parts the caller named, or a preset that matched nothing.
         known = {p["name"] for p in rig_data["parts"]}
-        missing = sorted(driven - known)
+        named = params.custom or {}
+        if isinstance(named.get("parts"), dict):
+            named = named["parts"]
+        missing = sorted({n for n in named if n != "*"} - known)
+        driven = {n for n in motion_parts if n != "*"}
+        if driven and not driven & known:
+            missing = sorted(driven)
 
         out_dir = Path(params.out_dir).expanduser()
         paths = [out_dir / f"{params.prefix}_f{i:02d}.png" for i in range(count)]
@@ -2571,7 +2640,8 @@ async def pixel_render_motion(params: RenderMotionInput) -> Any:
                     f"(e.g. {clashes[0]}). Pass overwrite=true, or use a different prefix."
                 )
 
-        images = rig.render_cycle(src, rig_data, motion_parts, count)
+        images = rig.render_cycle(src, rig_data, motion_parts, count,
+                                  ground=ground, lift=motion["lift"])
         out_dir.mkdir(parents=True, exist_ok=True)
         for img, path in zip(images, paths):
             img.save(path)
@@ -2583,6 +2653,7 @@ async def pixel_render_motion(params: RenderMotionInput) -> Any:
             "motion": label,
             "frames": count,
             "frame_size": f"{fw}x{fh}",
+            "ground_lock": ground,
             "out_dir": str(out_dir),
             "frame_paths": [str(p) for p in paths],
             "next": "pixel_export_gif with these frame_paths (duration_ms 100-125 reads as walking speed)",
@@ -2642,6 +2713,55 @@ async def pixel_motions(params: MotionsInput) -> str:
         return _error(exc)
 
 
+class LintInput(CanvasOp):
+    max_colors: int = Field(
+        default=16, ge=2, le=256,
+        description="Color budget: 16 for sprites, 32 for full scenes",
+    )
+    fix: bool = Field(
+        default=False,
+        description="Merge near-duplicate colors and clean stray pixels in place. Safe: "
+                    "high-contrast single pixels (eyes, glints) and dither patterns are "
+                    "never touched.",
+    )
+
+
+@mcp.tool(
+    name="pixel_lint",
+    annotations={
+        "title": "Lint Pixel Art",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def pixel_lint(params: LintInput) -> Any:
+    """Check a finished piece for the problems that make pixel art look
+    inconsistent, with coordinates — and fix the safe ones with fix=true.
+
+    Finds: near-duplicate colors (two shades nobody can tell apart, splitting
+    one material into noise), stray pixels (lone low-contrast specks), colors
+    over budget, stray semi-transparency, and a half-finished outline. Run it
+    as the last step of every piece, after pixel_outline_sprite and
+    pixel_apply_spaa; aim for score >= 90.
+
+    Returns JSON {"canvas", "score", "colors", "near_duplicates", "strays",
+    "outline_coverage", "issues", "fixed"?, "score_after"?}; plus a rendered
+    image when preview=true. On failure returns "Error: ...".
+    """
+    try:
+        p, img = _load(params.path)
+        report = craft.lint(img, params.max_colors, params.fix)
+        if params.fix:
+            img.save(p)
+            report["score_after"] = craft.lint(img.copy(), params.max_colors)["score"]
+        payload = {"canvas": str(p), **report}
+        return _result(payload, img, params.preview, getattr(params, "preview_diff", False))
+    except Exception as exc:
+        return _error(exc)
+
+
 # ---------------------------------------------------------------------------
 # Tools: reference knowledge
 # ---------------------------------------------------------------------------
@@ -2670,6 +2790,7 @@ def _batch_registry() -> dict[str, tuple[type[BaseModel], Any]]:
         "transform_canvas": (TransformInput, pixel_transform_canvas),
         "resize_canvas": (ResizeCanvasInput, pixel_resize_canvas),
         "scale_canvas": (ScaleCanvasInput, pixel_scale_canvas),
+        "lint": (LintInput, pixel_lint),
     }
 
 
@@ -2697,7 +2818,7 @@ async def pixel_batch(params: BatchInput) -> Any:
     draw_polygon, draw_curve, draw_gradient, paint_grid, flood_fill,
     replace_color, shade_region, apply_palette, outline_sprite, apply_spaa,
     mirror_canvas, copy_region, shift_canvas, transform_canvas, resize_canvas,
-    scale_canvas. Omit 'path' and preview flags from params.
+    scale_canvas, lint. Omit 'path' and preview flags from params.
 
     Example: [{"op": "draw_ellipse", "params": {"x": 4, "y": 4, "width": 24,
     "height": 24, "color": "#c22e2e"}}, {"op": "shade_region", "params":
@@ -2744,11 +2865,9 @@ async def pixel_batch(params: BatchInput) -> Any:
                 ok += 1
 
         _, final = _load(params.path)
-        bands = ImageChops.difference(before, final).split()
-        mask = bands[0]
-        for band in bands[1:]:
-            mask = ImageChops.lighter(mask, band)
-        changed = sum(1 for v in mask.getdata() if v) if before.size == final.size else -1
+        changed = -1
+        if before.size == final.size:
+            changed = sum(1 for v in _pixels(_changed_mask(before, final)) if v)
 
         payload: dict[str, Any] = {"canvas": str(p), "ok": ok}
         if changed >= 0:

@@ -139,3 +139,49 @@ filmstrip with `pixel_view_frames`.
 `examples/` holds pieces drawn with the full craft toolset (see the scripts
 alongside them) — the current quality ceiling of the tools, useful as a visual
 anchor when scoring: `apple` (subject 1) and `glass-bottle` (subject 2).
+
+## Automated checks
+
+The rubric needs eyes; two things don't, and are worth running on every
+tooling change:
+
+```bash
+# Re-render every scripted piece under two checkouts and lint both with one ruler
+python benchmarks/bench_stills.py --out /tmp/bench path/to/previous-release .
+# Animation sanity: torn joints, palette leaks, floor jitter, motion evenness
+python benchmarks/bench_motion.py benchmarks/examples/walk_sheet.png 32 benchmarks/examples/walker.png
+```
+
+`bench_stills.py` runs the scripts in a scratch copy, so committed run images
+are never overwritten. Lint score (0-100) penalizes near-duplicate colors,
+low-contrast stray specks, colors over budget, and half-finished outlines;
+it does not judge form or composition — check `compare.png` for that.
+
+### v0.6.0 → v0.7.0
+
+Same 21 scripts (19 stress pieces + 2 examples), unchanged, scored by the
+v0.7.0 linter:
+
+| | v0.6.0 | v0.7.0 |
+|---|---|---|
+| mean lint score | 86.8 | 88.7 |
+| near-duplicate color pairs | 40 | 35 |
+| example apple: score / colors | 62 / 26 | 92 / 17 |
+
+The gains come from tools, not from redrawing: selective outlines now reuse an
+existing dark instead of minting a near-identical one per neighbour color, and
+form shading allocates ramp steps by rank so the base color always dominates.
+The stress scripts were tuned by their authors against v0.3 shading, so most
+render near-identically — the gap is wider for new work.
+
+Walk cycle (`demo_walk.py`), v0.6 sliding limbs vs v0.7 jointed swing:
+
+| | v0.6.0 | v0.7.0 |
+|---|---|---|
+| components per frame | 1 | 1 |
+| palette leak | 0 | 0 |
+| floor jitter | 0 | 0 |
+| frame-to-frame motion, mean (min..max) | 0.28 (0.16..0.40) | 0.37 (0.32..0.43) |
+
+The motion spread is the flow measure: sliding blocks stall at each end of the
+stride and jump through the middle; swinging limbs move evenly.

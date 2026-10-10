@@ -2,36 +2,84 @@
   "parts": [
     {
       "name": "arm_back",
-      "x": 32,
-      "y": 20,
+      "x": 24,
+      "y": 14,
       "width": 4,
-      "height": 13,
+      "height": 8,
       "at_x": 10,
       "at_y": 15,
       "z": 0,
-      "anchor": "center"
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0
+    },
+    {
+      "name": "forearm_back",
+      "x": 29,
+      "y": 14,
+      "width": 4,
+      "height": 7,
+      "at_x": 10,
+      "at_y": 22,
+      "z": 0,
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0,
+      "parent": "arm_back"
     },
     {
       "name": "leg_back",
-      "x": 32,
+      "x": 24,
+      "y": 0,
+      "width": 4,
+      "height": 9,
+      "at_x": 12,
+      "at_y": 27,
+      "z": 1,
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0
+    },
+    {
+      "name": "shin_back",
+      "x": 29,
       "y": 0,
       "width": 6,
-      "height": 18,
+      "height": 11,
       "at_x": 12,
-      "at_y": 28,
+      "at_y": 35,
       "z": 1,
-      "anchor": "bottom"
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0,
+      "parent": "leg_back"
     },
     {
       "name": "leg_front",
-      "x": 39,
+      "x": 36,
+      "y": 0,
+      "width": 4,
+      "height": 9,
+      "at_x": 15,
+      "at_y": 27,
+      "z": 2,
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0
+    },
+    {
+      "name": "shin_front",
+      "x": 41,
       "y": 0,
       "width": 6,
-      "height": 18,
-      "at_x": 14,
-      "at_y": 28,
+      "height": 11,
+      "at_x": 15,
+      "at_y": 35,
       "z": 2,
-      "anchor": "bottom"
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0,
+      "parent": "leg_front"
     },
     {
       "name": "torso",
@@ -42,7 +90,9 @@
       "at_x": 11,
       "at_y": 13,
       "z": 3,
-      "anchor": "bottom"
+      "anchor": "bottom",
+      "pivot_x": 5,
+      "pivot_y": 0
     },
     {
       "name": "head",
@@ -53,21 +103,39 @@
       "at_x": 10,
       "at_y": 2,
       "z": 4,
-      "anchor": "center"
+      "anchor": "center",
+      "pivot_x": 6,
+      "pivot_y": 0
     },
     {
       "name": "arm_front",
-      "x": 38,
-      "y": 20,
+      "x": 34,
+      "y": 14,
       "width": 4,
-      "height": 13,
-      "at_x": 17,
+      "height": 8,
+      "at_x": 16,
       "at_y": 15,
       "z": 5,
-      "anchor": "center"
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0
+    },
+    {
+      "name": "forearm_front",
+      "x": 39,
+      "y": 14,
+      "width": 4,
+      "height": 7,
+      "at_x": 16,
+      "at_y": 22,
+      "z": 5,
+      "anchor": "bottom",
+      "pivot_x": 2,
+      "pivot_y": 0,
+      "parent": "arm_front"
     }
   ],
-  "source": "/Users/vaibhavpatel/Desktop/Code Projects/pixelart-mcp/benchmarks/examples/walker.png",
+  "source": "/home/user/pixelart-mcp/benchmarks/examples/walker.png",
   "width": 48,
   "height": 48,
   "frame_width": 32,
